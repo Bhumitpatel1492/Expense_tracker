@@ -65,6 +65,19 @@ const vapidPublicKey = String(args.vapid || cfg.vapidPublicKey || '');
 let token = '';
 if (!args['no-token']) token = String(args.token || await ask('GitHub fine-grained token for the data repo (Enter = skip, local mode)', { hidden: true }));
 
+if (token) {
+  if (!/^(github_pat_|ghp_)/.test(token)) {
+    console.error('\nThat does not look like a GitHub token (it should start with "github_pat_"). Copy it again with the "Copy token" button.');
+    process.exit(1);
+  }
+  const r = await fetch(`https://api.github.com/repos/${dataRepo}/contents/`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' } });
+  if (!r.ok) {
+    console.error(`\nGitHub rejected the token for ${dataRepo} (HTTP ${r.status}). Nothing was changed. Copy the token again and retry.`);
+    process.exit(1);
+  }
+  console.log(`Token checked: it can access ${dataRepo}.`);
+}
+
 const salt = crypto.getRandomValues(new Uint8Array(16));
 const encrypt = await encryptor(mobile, password, salt);
 const out = {
