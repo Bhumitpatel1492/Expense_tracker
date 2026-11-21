@@ -497,7 +497,7 @@ function viewSettings() {
         <button class="btn primary" data-action="enableReminders" type="button">Turn on</button>
         <button class="btn" data-action="testNotif" type="button">Test</button>
       </div>
-      ${remoteOn() && C.vapidPublicKey ? '' : '<p class="note">Reminders need GitHub sync and the VAPID key set up (see README).</p>'}
+      ${remoteOn() && C.vapidPublicKey ? '' : '<p class="note">Connect GitHub below (Data &amp; sync) to turn on reminders.</p>'}
     </section>
 
     <section class="card">
@@ -518,7 +518,13 @@ function viewSettings() {
 
     <section class="card">
       <h3>Data &amp; sync</h3>
-      <div class="set-row"><div>Storage<small>${remoteOn() ? `GitHub · ${esc(C.dataRepo)}` : 'This phone only (GitHub not set up)'}</small></div></div>
+      <div class="set-row"><div>Storage<small>${remoteOn() ? `GitHub · ${esc(C.dataRepo)}` : 'This phone only (GitHub not connected)'}</small></div></div>
+      ${!remoteOn() && C.dataRepo ? `
+      <form class="add-row" data-form="connectGh" style="margin:4px 0 8px">
+        <input name="token" type="password" autocomplete="off" placeholder="Paste GitHub token" required>
+        <button class="btn primary" type="submit">Connect</button>
+      </form>
+      <p class="note" style="margin:0 0 6px">One-time: fine-grained token with Contents read/write on <b>${esc(C.dataRepo)}</b>. It is saved only on this phone.</p>` : ''}
       <div class="set-row"><div>Last synced<small>${esc(last)}</small></div><button class="btn ghost" data-action="syncNow" type="button">Sync now</button></div>
       <div class="set-row"><div>Entries<small>${Store.txs.length} total</small></div><button class="btn ghost" data-action="exportCsv" type="button">Export CSV</button></div>
       ${Store.error ? `<p class="error">${esc(Store.error)}</p>` : ''}
@@ -753,7 +759,36 @@ function onFilter(e) {
 document.addEventListener('input', e => { if (e.target.matches('[data-filter="q"]')) onFilter(e); });
 document.addEventListener('change', e => { if (e.target.matches('[data-filter]:not([data-filter="q"])')) onFilter(e); });
 
-document.addEventListener('submit', e => {
+document.addEventListener('submit', async e => {
+  const gh = e.target.closest('[data-form="connectGh"]');
+  if (gh) {
+    e.preventDefault();
+    const token = gh.token.value.trim();
+    const btn = gh.querySelector('button');
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    try {
+      const r = await fetch(`https://api.github.com/repos/${C.dataRepo}/contents/`, {
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
+      });
+      if (r.status === 401) throw new Error('Token is invalid or expired');
+      if (r.status === 404 || r.status === 403) throw new Error(`Token has no access to ${C.dataRepo}`);
+      if (!r.ok) throw new Error(`GitHub error ${r.status}`);
+      session = { ...session, token };
+      ls.set(SESSION_KEY, session);
+      Store.dirty = true; // upload entries saved on this phone so far
+      Store.persist();
+      toast('GitHub connected ✓');
+      render();
+      Store.sync();
+    } catch (ex) {
+      toast(ex instanceof TypeError ? 'No internet connection' : ex.message, 3500);
+      btn.disabled = false;
+      btn.textContent = 'Connect';
+    }
+    return;
+  }
   const form = e.target.closest('[data-form="addCat"]');
   if (!form) return;
   e.preventDefault();
