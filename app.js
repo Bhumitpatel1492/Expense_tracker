@@ -853,6 +853,14 @@ function handleHash() {
 }
 
 function boot() {
+  // Logged in before GitHub sync was set up: ask to log in again so the token can be unlocked.
+  if (session && !session.token && C.auth && C.auth.token) {
+    session = null;
+    ls.del(SESSION_KEY);
+    showLogin();
+    $('#loginError').textContent = 'GitHub sync is now set up. Please log in again.';
+    return;
+  }
   if (!session) { showLogin(); return; }
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
@@ -863,7 +871,9 @@ function boot() {
 }
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW registration failed', e));
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+    .then(reg => reg.update())
+    .catch(e => console.warn('SW registration failed', e));
   navigator.serviceWorker.addEventListener('message', e => {
     if (e.data && e.data.type === 'open-add' && session) { closeSheet(); openSheet('expense'); }
   });
