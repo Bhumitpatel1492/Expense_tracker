@@ -93,6 +93,7 @@ async function decryptBox(key, box) {
 
 const SESSION_KEY = 'et_session';
 const CACHE_KEY = 'et_cache_v1';
+const TOKEN_KEY = 'et_device_token';
 let session = ls.get(SESSION_KEY);
 const remoteOn = () => !!(session && session.token && C.dataRepo);
 
@@ -229,6 +230,8 @@ const Store = {
       console.error(e);
       const offline = e instanceof TypeError || !navigator.onLine;
       this.setStatus(offline ? 'offline' : 'error', offline ? 'No internet — changes will sync later' : e.message);
+      this.authFailed = e.status === 401 || e.status === 403 || (e.status === 404 && /not found/i.test(e.message));
+      if (this.authFailed && ui.tab === 'settings' && !$('#sheetWrap:not(.hidden)')) render();
     } finally {
       this.syncing = false;
       if (JSON.stringify(this.doc) !== before && !$('#sheetWrap:not(.hidden)')) render();
@@ -519,7 +522,7 @@ function viewSettings() {
     <section class="card">
       <h3>Data &amp; sync</h3>
       <div class="set-row"><div>Storage<small>${remoteOn() ? `GitHub · ${esc(C.dataRepo)}` : 'This phone only (GitHub not connected)'}</small></div></div>
-      ${!remoteOn() && C.dataRepo ? `
+      ${(!remoteOn() || Store.authFailed) && C.dataRepo ? `
       <form class="add-row" data-form="connectGh" style="margin:4px 0 8px">
         <input name="token" type="password" autocomplete="off" placeholder="Paste GitHub token" required>
         <button class="btn primary" type="submit">Connect</button>
@@ -776,7 +779,9 @@ document.addEventListener('submit', async e => {
       if (r.status === 404 || r.status === 403) throw new Error(`Token has no access to ${C.dataRepo}`);
       if (!r.ok) throw new Error(`GitHub error ${r.status}`);
       session = { ...session, token };
+      Store.authFailed = false;
       ls.set(SESSION_KEY, session);
+      ls.set(TOKEN_KEY, token);
       Store.dirty = true; // upload entries saved on this phone so far
       Store.persist();
       toast('GitHub connected ✓');
@@ -831,7 +836,8 @@ $('#loginForm').addEventListener('submit', async e => {
     let ok = false;
     try { ok = (await decryptBox(key, C.auth.check)) === 'expense-tracker-ok'; } catch { ok = false; }
     if (!ok) { err.textContent = 'Wrong mobile number or password'; return; }
-    const token = C.auth.token ? await decryptBox(key, C.auth.token) : null;
+    // A token pasted in Settings on this device wins over the one in config.js.
+    const token = ls.get(TOKEN_KEY) || (C.auth.token ? await decryptBox(key, C.auth.token) : null);
     session = { token, at: Date.now() };
     ls.set(SESSION_KEY, session);
     $('#loginPass').value = '';

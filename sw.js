@@ -1,5 +1,5 @@
 /* Service worker: offline app shell + push reminders. Bump VERSION when app files change. */
-const VERSION = 'et-v3';
+const VERSION = 'et-v4';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './config.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/badge-96.png'];
 
