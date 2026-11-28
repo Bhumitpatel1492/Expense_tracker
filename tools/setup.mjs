@@ -63,7 +63,15 @@ if (!password) { console.error('Password is required'); process.exit(1); }
 const dataRepo = String('repo' in args ? args.repo : await ask('Private data repo (owner/name)', { def: cfg.dataRepo || '' }));
 const vapidPublicKey = String(args.vapid || cfg.vapidPublicKey || '');
 let token = '';
-if (!args['no-token']) token = String(args.token || await ask('GitHub fine-grained token for the data repo (Enter = skip, local mode)', { hidden: true }));
+// If a GitHub token is on the clipboard (from the "Copy token" button), use it without asking.
+let clip = '';
+try { clip = (await import('node:child_process')).execSync('pbpaste', { encoding: 'utf8' }).trim(); } catch { /* not macOS */ }
+if (!args['no-token'] && !args.token && /^github_pat_\w+$/.test(clip)) {
+  token = clip;
+  console.log('Using the GitHub token from your clipboard.');
+} else if (!args['no-token']) {
+  token = String(args.token || await ask('GitHub fine-grained token for the data repo (Enter = skip, local mode)', { hidden: true }));
+}
 
 if (token) {
   if (!/^(github_pat_|ghp_)/.test(token)) {
