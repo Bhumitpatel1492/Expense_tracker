@@ -18,7 +18,14 @@
     <form id="loginForm" class="login-card" autocomplete="on">
       <img src="icons/icon-192.png" alt="" class="login-logo">
       <h1>Expense Tracker</h1>
-      <p class="muted">Login to continue</p>
+      <div class="seg two" style="margin-top:16px">
+        <button type="button" id="modeLogin" class="on">Login</button>
+        <button type="button" id="modeSignup">Sign up</button>
+      </div>
+      <label class="field signup-only hidden">
+        <span>Your name</span>
+        <input id="loginName" maxlength="40" placeholder="e.g. Bhumit" autocomplete="name">
+      </label>
       <label class="field">
         <span>Mobile number</span>
         <input id="loginMobile" type="tel" inputmode="numeric" maxlength="10" placeholder="10 digit mobile" autocomplete="username" required>
@@ -26,9 +33,13 @@
       <label class="field">
         <span>Password</span>
         <div class="pw-wrap">
-          <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" required>
+          <input id="loginPass" type="password" placeholder="Password (min 6 characters)" autocomplete="current-password" required>
           <button type="button" id="pwToggle" class="pw-toggle" aria-label="Show password">Show</button>
         </div>
+      </label>
+      <label class="field signup-only hidden">
+        <span>Invite code</span>
+        <input id="loginInvite" autocomplete="off" autocapitalize="characters" placeholder="Ask the app owner">
       </label>
       <p id="loginError" class="error" role="alert"></p>
       <button id="loginBtn" class="btn primary block" type="submit">Login</button>
@@ -74,6 +85,6 @@
   <div id="toast" class="toast" role="status"></div>
 
   <script src="config.js"></script>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

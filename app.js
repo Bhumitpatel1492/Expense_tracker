@@ -1,10 +1,23 @@
-'use strict';
-/* Personal Expense Tracker — vanilla JS PWA.
- * Storage: a JSON file (data.json) in a private GitHub repo via the GitHub Contents API.
- * The GitHub token is stored AES-GCM encrypted in config.js; the key is derived from mobile + password,
- * so only the correct login can decrypt it. Without a token the app runs in "local only" mode. */
+/* Expense Tracker — multi-user PWA on Firebase.
+ * Login: Firebase Auth (mobile number used as the username, password).
+ * Data: Firestore, users/{uid} (profile + categories) and users/{uid}/transactions/{id}.
+ * Security rules (firebase/firestore.rules) let each user read and write only their own data.
+ * Reminders: Firebase Cloud Messaging tokens in users/{uid}/devices, sent by a GitHub Actions job. */
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import {
+  getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut,
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import {
+  initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  doc, getDoc, setDoc, updateDoc, deleteDoc, collection, onSnapshot,
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+import { getMessaging, getToken, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
 
 const C = window.APP_CONFIG || {};
+const fbApp = initializeApp(C.firebase);
+const auth = getAuth(fbApp);
+const db = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+const mobileToEmail = m => `${m}@${C.emailDomain || 'expensetracker.app'}`;
 
 /* ---------------- helpers ---------------- */
 const $ = (s, el = document) => el.querySelector(s);
@@ -57,212 +70,77 @@ const icon = c => ICONS[c] || '🏷️';
 const PAY_MODES = ['UPI', 'Cash', 'Card', 'Bank'];
 const PERIODS = { day: 'Date', month: 'Month', year: 'Year', range: 'Range', all: 'All' };
 
-const defaultDoc = () => ({ version: 1, categories: structuredClone(DEFAULT_CATS), transactions: [], deleted: [] });
-const normalize = d => ({
-  version: 1,
-  categories: {
-    expense: Array.isArray(d?.categories?.expense) && d.categories.expense.length ? [...d.categories.expense] : [...DEFAULT_CATS.expense],
-    income: Array.isArray(d?.categories?.income) && d.categories.income.length ? [...d.categories.income] : [...DEFAULT_CATS.income],
-  },
-  transactions: Array.isArray(d?.transactions) ? d.transactions.filter(t => t && t.id && t.date) : [],
-  deleted: Array.isArray(d?.deleted) ? d.deleted : [],
-});
-
-/* ---------------- crypto / session ---------------- */
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-const b64d = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-function utf8ToB64(str) {
-  const bytes = enc.encode(str);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
-}
-const b64ToUtf8 = b => dec.decode(b64d(b.replace(/\s/g, '')));
-
-async function deriveKey(mobile, password) {
-  const base = await crypto.subtle.importKey('raw', enc.encode(`${mobile.trim()}:${password}`), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: b64d(C.auth.salt), iterations: C.auth.iterations, hash: 'SHA-256' },
-    base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-}
-async function decryptBox(key, box) {
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(box.iv) }, key, b64d(box.ct));
-  return dec.decode(pt);
-}
-
-const SESSION_KEY = 'et_session';
-const CACHE_KEY = 'et_cache_v1';
-const TOKEN_KEY = 'et_device_token';
-let session = ls.get(SESSION_KEY);
-const remoteOn = () => !!(session && session.token && C.dataRepo);
-
-/* ---------------- GitHub storage ---------------- */
-class HttpError extends Error {
-  constructor(status, msg) { super(msg); this.status = status; }
-}
-function gh(path, opts = {}) {
-  return fetch(`https://api.github.com/repos/${C.dataRepo}/contents/${path}`, {
-    ...opts,
-    cache: 'no-store',
-    headers: {
-      Authorization: `Bearer ${session.token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(opts.headers || {}),
-    },
-  });
-}
-async function httpErr(r) {
-  let msg = `GitHub error ${r.status}`;
-  try { const j = await r.json(); if (j.message) msg += `: ${j.message}`; } catch { /* ignore */ }
-  if (r.status === 401) msg = 'GitHub token is invalid or expired';
-  if (r.status === 404) msg = 'Data repo not found (check repo name / token access)';
-  return new HttpError(r.status, msg);
-}
-async function ghGet(path) {
-  const r = await gh(path);
-  if (r.status === 404) {
-    // 404 can mean "file missing" (fine) or "repo inaccessible". Distinguish by checking the repo.
-    const repo = await fetch(`https://api.github.com/repos/${C.dataRepo}`, { cache: 'no-store', headers: { Authorization: `Bearer ${session.token}`, Accept: 'application/vnd.github+json' } });
-    if (!repo.ok) throw await httpErr(repo);
-    return { data: null, sha: null };
-  }
-  if (!r.ok) throw await httpErr(r);
-  const j = await r.json();
-  let text = j.encoding === 'base64' && j.content ? b64ToUtf8(j.content) : '';
-  if (!text && j.size > 0) {
-    // Files over 1 MB come back without content; fetch the raw body instead.
-    const r2 = await gh(path, { headers: { Accept: 'application/vnd.github.raw+json' } });
-    if (!r2.ok) throw await httpErr(r2);
-    text = await r2.text();
-  }
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { throw new Error(`${path} in the data repo is not valid JSON`); }
-  return { data, sha: j.sha };
-}
-async function ghPut(path, text, sha, message) {
-  const body = { message, content: utf8ToB64(text) };
-  if (sha) body.sha = sha;
-  const r = await gh(path, { method: 'PUT', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
-  if (r.status === 409 || r.status === 422) { const e = new Error('Save conflict'); e.conflict = true; throw e; }
-  if (!r.ok) throw await httpErr(r);
-  return (await r.json()).content.sha;
-}
-
-function serialize(d) {
-  const tx = [...d.transactions].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0)));
-  return '{\n"version": 1,\n"categories": ' + JSON.stringify(d.categories) +
-    ',\n"deleted": ' + JSON.stringify(d.deleted) +
-    ',\n"transactions": [\n' + tx.map(t => JSON.stringify(t)).join(',\n') + '\n]\n}\n';
-}
-
-// Merge remote + local: union by id, newest updatedAt wins, tombstones remove. Local categories win.
-function merge(remote, local) {
-  const deleted = new Set([...remote.deleted, ...local.deleted]);
-  const map = new Map();
-  for (const t of [...remote.transactions, ...local.transactions]) {
-    if (deleted.has(t.id)) continue;
-    const prev = map.get(t.id);
-    if (!prev || (t.updatedAt || 0) >= (prev.updatedAt || 0)) map.set(t.id, t);
-  }
-  return { version: 1, categories: local.categories, deleted: [...deleted].slice(-3000), transactions: [...map.values()] };
-}
-
+/* ---------------- Firestore store ---------------- */
 const Store = {
-  doc: defaultDoc(), sha: null, dirty: false, rev: 0, syncing: false, again: false,
-  status: 'idle', error: '', lastSync: null,
-
-  init() {
-    const c = ls.get(CACHE_KEY);
-    this.doc = normalize(c && c.doc);
-    this.sha = (c && c.sha) || null;
-    this.dirty = !!(c && c.dirty);
-    this.lastSync = (c && c.lastSync) || null;
+  uid: null, profile: null, txs: [], status: 'idle', error: '', unsubs: [], pending: false,
+  get doc() {
+    const c = (this.profile && this.profile.categories) || {};
+    return {
+      categories: {
+        expense: Array.isArray(c.expense) && c.expense.length ? c.expense : DEFAULT_CATS.expense,
+        income: Array.isArray(c.income) && c.income.length ? c.income : DEFAULT_CATS.income,
+      },
+      transactions: this.txs,
+    };
   },
-  persist() { ls.set(CACHE_KEY, { doc: this.doc, sha: this.sha, dirty: this.dirty, lastSync: this.lastSync }); },
-  get txs() { return this.doc.transactions; },
+  userRef() { return doc(db, 'users', this.uid); },
+  txRef(id) { return doc(db, 'users', this.uid, 'transactions', id); },
 
-  mutate(fn) {
-    fn(this.doc);
-    this.dirty = true;
-    this.rev++;
-    this.persist();
-    render();
-    clearTimeout(this._t);
-    this._t = setTimeout(() => this.sync(), 300);
+  start(uid, profile) {
+    this.stop();
+    this.uid = uid;
+    this.profile = profile;
+    this.setStatus(navigator.onLine ? 'saving' : 'offline');
+    this.unsubs.push(onSnapshot(this.userRef(), snap => {
+      if (snap.exists()) { this.profile = snap.data(); refreshView(); }
+    }, err => this.fail(err)));
+    this.unsubs.push(onSnapshot(collection(db, 'users', uid, 'transactions'), { includeMetadataChanges: true }, snap => {
+      this.txs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      this.pending = snap.metadata.hasPendingWrites;
+      this.setStatus(!navigator.onLine ? 'offline' : this.pending || snap.metadata.fromCache ? 'saving' : 'synced');
+      refreshView();
+    }, err => this.fail(err)));
+  },
+  stop() {
+    this.unsubs.forEach(u => u());
+    this.unsubs = [];
+    this.uid = null;
+    this.profile = null;
+    this.txs = [];
+  },
+  fail(err) {
+    console.error(err);
+    this.setStatus('error', err.code === 'permission-denied' ? 'This account is not allowed to access data' : err.message);
   },
   setStatus(s, err = '') { this.status = s; this.error = err; updateSyncBadge(); },
 
-  async sync() {
-    if (!remoteOn()) { this.setStatus('local'); return; }
-    if (this.syncing) { this.again = true; return; }
-    if (!navigator.onLine) { this.setStatus('offline'); return; }
-    this.syncing = true;
-    this.again = false;
-    this.setStatus('saving');
-    const before = JSON.stringify(this.doc);
-    try {
-      for (let attempt = 0; ; attempt++) {
-        const startRev = this.rev;
-        const remote = await ghGet('data.json');
-        if (this.rev !== startRev) continue; // edited while fetching — fetch again
-        const wasDirty = this.dirty;
-        const rdoc = remote.data ? normalize(remote.data) : null;
-        this.doc = rdoc ? (wasDirty ? merge(rdoc, this.doc) : rdoc) : this.doc;
-        this.sha = remote.sha;
-        if (wasDirty || !rdoc) {
-          try {
-            this.sha = await ghPut('data.json', serialize(this.doc), remote.sha, `Update ${today()}`);
-          } catch (e) {
-            if (e.conflict && attempt < 4) { await sleep(700 * (attempt + 1)); continue; }
-            throw e;
-          }
-        }
-        if (this.rev === startRev) this.dirty = false;
-        else this.again = true;
-        break;
-      }
-      this.lastSync = Date.now();
-      this.persist();
-      this.setStatus('synced');
-    } catch (e) {
-      console.error(e);
-      const offline = e instanceof TypeError || !navigator.onLine;
-      this.setStatus(offline ? 'offline' : 'error', offline ? 'No internet — changes will sync later' : e.message);
-      this.authFailed = e.status === 401 || e.status === 403 || (e.status === 404 && /not found/i.test(e.message));
-      if (this.authFailed && ui.tab === 'settings' && !$('#sheetWrap:not(.hidden)')) render();
-    } finally {
-      this.syncing = false;
-      if (JSON.stringify(this.doc) !== before && !$('#sheetWrap:not(.hidden)')) render();
-      if (this.again) this.sync();
-    }
+  // Writes are applied locally at once (offline-safe) and synced by Firestore in the background.
+  saveTx(id, data) { setDoc(this.txRef(id), data, { merge: true }).catch(e => this.fail(e)); },
+  deleteTx(id) { deleteDoc(this.txRef(id)).catch(e => this.fail(e)); },
+  setCategories(type, list) {
+    if (this.profile) this.profile = { ...this.profile, categories: { ...this.doc.categories, [type]: list } };
+    refreshView();
+    updateDoc(this.userRef(), { [`categories.${type}`]: list }).catch(e => this.fail(e));
   },
 };
-
-async function saveSubscription(sub) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const r = await ghGet('subscriptions.json');
-    const list = ((r.data && r.data.subscriptions) || []).filter(s => s.endpoint !== sub.endpoint);
-    list.push({ ...sub, device: navigator.userAgent.slice(0, 140), addedAt: new Date().toISOString() });
-    try {
-      await ghPut('subscriptions.json', JSON.stringify({ subscriptions: list }, null, 2) + '\n', r.sha, 'Add reminder device');
-      return;
-    } catch (e) {
-      if (!e.conflict) throw e;
-      await sleep(700 * (attempt + 1));
-    }
-  }
-  throw new Error('Could not save reminder device, try again');
-}
 
 function updateSyncBadge() {
   const b = $('#syncBadge');
   if (!b) return;
-  const labels = { idle: 'Loading', local: 'Local only', saving: 'Syncing…', synced: 'Synced', offline: 'Offline', error: 'Sync error' };
+  const labels = { idle: 'Loading', saving: 'Syncing…', synced: 'Synced', offline: 'Offline', error: 'Sync error' };
   b.className = 'sync ' + Store.status;
   b.textContent = labels[Store.status] || '';
   b.title = Store.error || '';
+}
+
+// Re-render without stealing focus from an input the user is typing in.
+function refreshView() {
+  if (!Store.uid) return;
+  const active = document.activeElement;
+  const typing = active && active.closest && active.closest('#view') && /INPUT|SELECT|TEXTAREA/.test(active.tagName);
+  if (typing && (ui.tab === 'income' || ui.tab === 'expense')) { renderResults(ui.tab); return; }
+  if (typing) return;
+  render();
 }
 
 /* ---------------- UI state ---------------- */
@@ -489,8 +367,14 @@ function renderResults(type) {
 function viewSettings() {
   const t = ui.catType;
   const cats = Store.doc.categories[t];
-  const last = Store.lastSync ? new Date(Store.lastSync).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : 'never';
+  const p = Store.profile || {};
+  const syncText = { synced: 'Saved to cloud', saving: 'Syncing…', offline: 'Offline: saved on this phone, will sync later', error: 'Sync error', idle: 'Loading' }[Store.status];
   return `
+    <section class="card">
+      <h3>Account</h3>
+      <div class="set-row"><div>${esc(p.name || 'You')}<small>Mobile ${esc(p.mobile || '')}</small></div></div>
+    </section>
+
     <section class="card">
       <h3>Reminders</h3>
       <div class="muted" style="font-size:14px">A daily notification to add today's payments:</div>
@@ -500,7 +384,7 @@ function viewSettings() {
         <button class="btn primary" data-action="enableReminders" type="button">Turn on</button>
         <button class="btn" data-action="testNotif" type="button">Test</button>
       </div>
-      ${remoteOn() && C.vapidPublicKey ? '' : '<p class="note">Connect GitHub below (Data &amp; sync) to turn on reminders.</p>'}
+      <p class="note">Each person gets reminders with their own totals.</p>
     </section>
 
     <section class="card">
@@ -521,20 +405,14 @@ function viewSettings() {
 
     <section class="card">
       <h3>Data &amp; sync</h3>
-      <div class="set-row"><div>Storage<small>${remoteOn() ? `GitHub · ${esc(C.dataRepo)}` : 'This phone only (GitHub not connected)'}</small></div></div>
-      ${(!remoteOn() || Store.authFailed) && C.dataRepo ? `
-      <form class="add-row" data-form="connectGh" style="margin:4px 0 8px">
-        <input name="token" type="password" autocomplete="off" placeholder="Paste GitHub token" required>
-        <button class="btn primary" type="submit">Connect</button>
-      </form>
-      <p class="note" style="margin:0 0 6px">One-time: fine-grained token with Contents read/write on <b>${esc(C.dataRepo)}</b>. It is saved only on this phone.</p>` : ''}
-      <div class="set-row"><div>Last synced<small>${esc(last)}</small></div><button class="btn ghost" data-action="syncNow" type="button">Sync now</button></div>
+      <div class="set-row"><div>Storage<small>Private cloud (Firebase) · only you can see it</small></div></div>
+      <div class="set-row"><div>Status<small>${esc(syncText)}</small></div></div>
       <div class="set-row"><div>Entries<small>${Store.txs.length} total</small></div><button class="btn ghost" data-action="exportCsv" type="button">Export CSV</button></div>
       ${Store.error ? `<p class="error">${esc(Store.error)}</p>` : ''}
     </section>
 
     <button class="btn danger block" data-action="logout" type="button">Logout</button>
-    <p class="note" style="text-align:center">Expense Tracker · v1.0</p>`;
+    <p class="note" style="text-align:center">Expense Tracker · v2.0</p>`;
 }
 
 /* ---------------- add / edit sheet ---------------- */
@@ -593,21 +471,22 @@ function addCategory(type, name) {
   if (!name) return null;
   const existing = Store.doc.categories[type].find(c => c.toLowerCase() === name.toLowerCase());
   if (existing) return existing;
-  Store.mutate(doc => { doc.categories[type].push(name); });
+  Store.setCategories(type, [...Store.doc.categories[type], name]);
   return name;
 }
 
-/* ---------------- reminders ---------------- */
-function b64urlToBytes(s) {
-  const p = '='.repeat((4 - s.length % 4) % 4);
-  return b64d((s + p).replace(/-/g, '+').replace(/_/g, '/'));
+
+/* ---------------- reminders (Firebase Cloud Messaging) ---------------- */
+const FCM_KEY = 'et_fcm_token';
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function tokenId(token) {
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+  return [...new Uint8Array(h)].slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 async function reminderState() {
-  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return 'unsupported';
+  if (!('serviceWorker' in navigator) || !('Notification' in window) || !(await isSupported().catch(() => false))) return 'unsupported';
   if (Notification.permission === 'denied') return 'denied';
-  const reg = await navigator.serviceWorker.getRegistration();
-  const sub = reg && await reg.pushManager.getSubscription();
-  return sub && ls.get('et_push_saved') === sub.endpoint ? 'on' : 'off';
+  return Notification.permission === 'granted' && ls.get(FCM_KEY) ? 'on' : 'off';
 }
 async function fillReminderStatus() {
   const el = $('#remStatus');
@@ -617,18 +496,21 @@ async function fillReminderStatus() {
   [el.textContent, el.className] = map[st];
 }
 async function enableReminders(btn) {
-  if (!remoteOn()) return toast('Set up GitHub sync first (see README)');
-  if (!C.vapidPublicKey) return toast('VAPID public key missing in config.js');
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return toast('This browser does not support push notifications');
+  if (!(await isSupported().catch(() => false))) return toast('This browser does not support notifications');
   btn.disabled = true;
   try {
     const perm = await Notification.requestPermission();
     if (perm !== 'granted') { toast('Notification permission was not given'); return; }
     const reg = await navigator.serviceWorker.ready;
-    let sub = await reg.pushManager.getSubscription();
-    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlToBytes(C.vapidPublicKey) });
-    await saveSubscription(sub.toJSON());
-    ls.set('et_push_saved', sub.endpoint);
+    // A push subscription made with an older key blocks Firebase from subscribing: remove it.
+    const old = await reg.pushManager.getSubscription();
+    if (old && old.options && old.options.applicationServerKey && b64url(old.options.applicationServerKey) !== C.vapidKey) await old.unsubscribe();
+    const token = await getToken(getMessaging(fbApp), { vapidKey: C.vapidKey, serviceWorkerRegistration: reg });
+    if (!token) throw new Error('No push token received');
+    await setDoc(doc(db, 'users', Store.uid, 'devices', await tokenId(token)), {
+      token, device: navigator.userAgent.slice(0, 140), updatedAt: Date.now(),
+    });
+    ls.set(FCM_KEY, token);
     toast('Reminders enabled ✓');
   } catch (e) {
     console.error(e);
@@ -682,7 +564,7 @@ const actions = {
     const name = Store.doc.categories[t][Number(el.dataset.i)];
     if (Store.doc.categories[t].length <= 1) return toast('Keep at least one category');
     if (!confirm(`Delete category "${name}"?\nOld entries keep this category name.`)) return;
-    Store.mutate(doc => { doc.categories[t] = doc.categories[t].filter(c => c !== name); });
+    Store.setCategories(t, Store.doc.categories[t].filter(c => c !== name));
   },
   sheetType(el) { readSheet(); if (sheetState.type !== el.dataset.t) { sheetState.type = el.dataset.t; sheetState.category = ''; } renderSheet(); },
   pickCat(el) { readSheet(); sheetState.category = el.dataset.c; $$('#sheet [data-action="pickCat"]').forEach(b => b.classList.toggle('on', b === el)); },
@@ -709,37 +591,30 @@ const actions = {
     const now = Date.now();
     const id = s.id;
     closeSheet();
-    Store.mutate(doc => {
-      const t = id && doc.transactions.find(x => x.id === id);
-      if (t) Object.assign(t, data, { updatedAt: now });
-      else doc.transactions.push({ id: uid(), ...data, createdAt: now, updatedAt: now });
-    });
+    if (id) Store.saveTx(id, { ...data, updatedAt: now });
+    else Store.saveTx(uid(), { ...data, createdAt: now, updatedAt: now });
     toast(id ? 'Updated ✓' : `${data.type === 'income' ? 'Income' : 'Expense'} saved ✓`);
   },
   deleteTx() {
     const id = sheetState.id;
     if (!confirm('Delete this entry?')) return;
     closeSheet();
-    Store.mutate(doc => {
-      doc.transactions = doc.transactions.filter(t => t.id !== id);
-      doc.deleted.push(id);
-    });
+    Store.deleteTx(id);
     toast('Deleted');
   },
   syncNow() {
-    if (!remoteOn()) return toast('Local mode: data is saved on this phone only');
-    if (Store.status === 'error' && Store.error) toast(Store.error, 3500);
-    Store.sync();
+    const msg = { synced: 'All changes are saved to the cloud', saving: 'Syncing…', offline: 'Offline: changes will sync when you are online' }[Store.status];
+    toast(Store.status === 'error' ? Store.error || 'Sync error' : msg || 'Loading…', 3000);
   },
   enableReminders(el) { enableReminders(el); },
   testNotif() { testNotif().catch(e => toast(e.message)); },
   exportCsv,
-  logout() {
-    const warn = Store.dirty && remoteOn() ? '\nSome changes are not synced yet and will be lost.' : '';
+  async logout() {
+    const warn = Store.pending ? '\nSome changes are not synced yet and will be lost.' : '';
     if (!confirm('Logout from this phone?' + warn)) return;
-    ls.del(SESSION_KEY);
-    ls.del(CACHE_KEY);
-    session = null;
+    ls.del(FCM_KEY);
+    Store.stop();
+    await signOut(auth);
     location.reload();
   },
 };
@@ -762,38 +637,7 @@ function onFilter(e) {
 document.addEventListener('input', e => { if (e.target.matches('[data-filter="q"]')) onFilter(e); });
 document.addEventListener('change', e => { if (e.target.matches('[data-filter]:not([data-filter="q"])')) onFilter(e); });
 
-document.addEventListener('submit', async e => {
-  const gh = e.target.closest('[data-form="connectGh"]');
-  if (gh) {
-    e.preventDefault();
-    const token = gh.token.value.trim();
-    const btn = gh.querySelector('button');
-    btn.disabled = true;
-    btn.textContent = 'Checking…';
-    try {
-      const r = await fetch(`https://api.github.com/repos/${C.dataRepo}/contents/`, {
-        cache: 'no-store',
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
-      });
-      if (r.status === 401) throw new Error('Token is invalid or expired');
-      if (r.status === 404 || r.status === 403) throw new Error(`Token has no access to ${C.dataRepo}`);
-      if (!r.ok) throw new Error(`GitHub error ${r.status}`);
-      session = { ...session, token };
-      Store.authFailed = false;
-      ls.set(SESSION_KEY, session);
-      ls.set(TOKEN_KEY, token);
-      Store.dirty = true; // upload entries saved on this phone so far
-      Store.persist();
-      toast('GitHub connected ✓');
-      render();
-      Store.sync();
-    } catch (ex) {
-      toast(ex instanceof TypeError ? 'No internet connection' : ex.message, 3500);
-      btn.disabled = false;
-      btn.textContent = 'Connect';
-    }
-    return;
-  }
+document.addEventListener('submit', e => {
   const form = e.target.closest('[data-form="addCat"]');
   if (!form) return;
   e.preventDefault();
@@ -806,10 +650,27 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.target.id === 'fNewCat') { e.preventDefault(); actions.saveNewCat(); }
 });
 
-/* ---------------- login & boot ---------------- */
-function showLogin() {
+
+/* ---------------- login, sign-up & boot ---------------- */
+let authMode = 'login';
+let signingUp = false;
+
+function setAuthMode(mode) {
+  authMode = mode;
+  $('#modeLogin').classList.toggle('on', mode === 'login');
+  $('#modeSignup').classList.toggle('on', mode === 'signup');
+  $$('.signup-only').forEach(el => el.classList.toggle('hidden', mode !== 'signup'));
+  $('#loginBtn').textContent = mode === 'signup' ? 'Create account' : 'Login';
+  $('#loginPass').autocomplete = mode === 'signup' ? 'new-password' : 'current-password';
+  $('#loginError').textContent = '';
+}
+$('#modeLogin').addEventListener('click', () => setAuthMode('login'));
+$('#modeSignup').addEventListener('click', () => setAuthMode('signup'));
+
+function showLogin(msg = '') {
   $('#app').classList.add('hidden');
   $('#login').classList.remove('hidden');
+  $('#loginError').textContent = msg;
 }
 
 $('#pwToggle').addEventListener('click', () => {
@@ -819,6 +680,17 @@ $('#pwToggle').addEventListener('click', () => {
   $('#pwToggle').textContent = show ? 'Hide' : 'Show';
 });
 
+function authMessage(e) {
+  const code = (e && e.code) || '';
+  if (/invalid-credential|wrong-password|user-not-found|invalid-email/.test(code)) return 'Wrong mobile number or password';
+  if (code.includes('email-already-in-use')) return 'This mobile number already has an account. Please login.';
+  if (code.includes('weak-password')) return 'Password must be at least 6 characters';
+  if (code.includes('too-many-requests')) return 'Too many tries. Please wait a few minutes.';
+  if (code.includes('network-request-failed')) return 'No internet connection';
+  if (code === 'permission-denied') return 'Invite code is not correct';
+  return (e && e.message) || 'Something went wrong';
+}
+
 $('#loginForm').addEventListener('submit', async e => {
   e.preventDefault();
   const err = $('#loginError');
@@ -827,53 +699,71 @@ $('#loginForm').addEventListener('submit', async e => {
   const mobile = $('#loginMobile').value.replace(/\D/g, '');
   const pass = $('#loginPass').value;
   if (mobile.length !== 10) { err.textContent = 'Enter a valid 10 digit mobile number'; return; }
-  if (!C.auth || !C.auth.check) { err.textContent = 'App is not configured (config.js missing)'; return; }
-  if (!window.crypto || !crypto.subtle) { err.textContent = 'Open the app over https to login'; return; }
+  if (pass.length < 6) { err.textContent = 'Password must be at least 6 characters'; return; }
   btn.disabled = true;
-  btn.textContent = 'Checking…';
+  btn.textContent = authMode === 'signup' ? 'Creating…' : 'Checking…';
   try {
-    const key = await deriveKey(mobile, pass);
-    let ok = false;
-    try { ok = (await decryptBox(key, C.auth.check)) === 'expense-tracker-ok'; } catch { ok = false; }
-    if (!ok) { err.textContent = 'Wrong mobile number or password'; return; }
-    // A token pasted in Settings on this device wins over the one in config.js.
-    const token = ls.get(TOKEN_KEY) || (C.auth.token ? await decryptBox(key, C.auth.token) : null);
-    session = { token, at: Date.now() };
-    ls.set(SESSION_KEY, session);
+    if (authMode === 'signup') {
+      const name = $('#loginName').value.trim();
+      const invite = $('#loginInvite').value.trim().toUpperCase();
+      if (!name) throw Object.assign(new Error('Enter your name'), { code: 'x' });
+      if (!invite) throw Object.assign(new Error('Enter the invite code'), { code: 'x' });
+      signingUp = true;
+      const cred = await createUserWithEmailAndPassword(auth, mobileToEmail(mobile), pass);
+      const profile = { name, mobile, invite, categories: structuredClone(DEFAULT_CATS), createdAt: Date.now() };
+      try {
+        await setDoc(doc(db, 'users', cred.user.uid), profile);
+      } catch (ex) {
+        await cred.user.delete().catch(() => signOut(auth)); // wrong invite: remove the half-made account
+        throw ex;
+      }
+      signingUp = false;
+      enterApp(cred.user, profile);
+    } else {
+      await signInWithEmailAndPassword(auth, mobileToEmail(mobile), pass);
+    }
     $('#loginPass').value = '';
-    boot();
   } catch (ex) {
+    signingUp = false;
     console.error(ex);
-    err.textContent = 'Login failed: ' + ex.message;
+    err.textContent = authMessage(ex);
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Login';
+    btn.textContent = authMode === 'signup' ? 'Create account' : 'Login';
+  }
+});
+
+function enterApp(user, profile) {
+  $('#login').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  Store.start(user.uid, profile);
+  render();
+  handleHash();
+}
+
+onAuthStateChanged(auth, async user => {
+  if (signingUp) return; // the sign-up handler finishes the setup itself
+  if (!user) { Store.stop(); showLogin(); return; }
+  try {
+    const snap = await getDoc(doc(db, 'users', user.uid));
+    if (!snap.exists()) {
+      await signOut(auth);
+      showLogin('This account is not set up. Please sign up with an invite code.');
+      return;
+    }
+    enterApp(user, snap.data());
+  } catch (e) {
+    // Offline with nothing cached yet: still open the app; data appears once online.
+    console.error(e);
+    enterApp(user, null);
   }
 });
 
 function handleHash() {
   if (location.hash === '#add') {
     history.replaceState(null, '', location.pathname + location.search);
-    if (session) openSheet('expense');
+    if (Store.uid) openSheet('expense');
   }
-}
-
-function boot() {
-  // Logged in before GitHub sync was set up: ask to log in again so the token can be unlocked.
-  if (session && !session.token && C.auth && C.auth.token) {
-    session = null;
-    ls.del(SESSION_KEY);
-    showLogin();
-    $('#loginError').textContent = 'GitHub sync is now set up. Please log in again.';
-    return;
-  }
-  if (!session) { showLogin(); return; }
-  $('#login').classList.add('hidden');
-  $('#app').classList.remove('hidden');
-  Store.init();
-  render();
-  Store.sync();
-  handleHash();
 }
 
 if ('serviceWorker' in navigator) {
@@ -881,13 +771,9 @@ if ('serviceWorker' in navigator) {
     .then(reg => reg.update())
     .catch(e => console.warn('SW registration failed', e));
   navigator.serviceWorker.addEventListener('message', e => {
-    if (e.data && e.data.type === 'open-add' && session) { closeSheet(); openSheet('expense'); }
+    if (e.data && e.data.type === 'open-add' && Store.uid) { closeSheet(); openSheet('expense'); }
   });
 }
 window.addEventListener('hashchange', handleHash);
-window.addEventListener('online', () => session && Store.sync());
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && session && remoteOn() && (!Store.lastSync || Date.now() - Store.lastSync > 30000)) Store.sync();
-});
-
-boot();
+window.addEventListener('online', () => Store.uid && Store.setStatus(Store.pending ? 'saving' : 'synced'));
+window.addEventListener('offline', () => Store.uid && Store.setStatus('offline'));
