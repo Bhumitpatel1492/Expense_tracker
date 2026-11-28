@@ -1,5 +1,5 @@
 /* Service worker: offline app shell + push reminders. Bump VERSION when app files change. */
-const VERSION = 'et-v5';
+const VERSION = 'et-v6';
 const SDK_CACHE = 'firebase-sdk-10.12.2';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './config.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/badge-96.png'];

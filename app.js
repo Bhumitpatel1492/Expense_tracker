@@ -206,11 +206,22 @@ function render() {
 
 function txRow(t) {
   const sub = [t.mode && t.type === 'expense' ? t.mode : '', t.note || ''].filter(Boolean).join(' · ');
-  return `<button class="tx ${t.type}" data-action="edit" data-id="${esc(t.id)}" type="button">
-    <span class="ic">${icon(t.category)}</span>
-    <span class="mid"><b>${esc(t.category)}</b>${sub ? `<small>${esc(sub)}</small>` : ''}</span>
-    <span class="amt">${t.type === 'income' ? '+' : '−'}${money(t.amount)}</span>
-  </button>`;
+  const id = esc(t.id);
+  return `<div class="tx ${t.type}">
+    <button class="tx-main" data-action="edit" data-id="${id}" type="button">
+      <span class="ic">${icon(t.category)}</span>
+      <span class="mid"><b>${esc(t.category)}</b>${sub ? `<small>${esc(sub)}</small>` : ''}</span>
+      <span class="amt">${t.type === 'income' ? '+' : '−'}${money(t.amount)}</span>
+    </button>
+    <span class="tx-actions">
+      <button class="tx-btn" data-action="edit" data-id="${id}" type="button" aria-label="Edit entry" title="Edit">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 20h4L19 9l-4-4L4 16v4zM14 6l4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="tx-btn del" data-action="quickDelete" data-id="${id}" type="button" aria-label="Delete entry" title="Delete">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </span>
+  </div>`;
 }
 
 function groupedList(list) {
@@ -594,6 +605,13 @@ const actions = {
     if (id) Store.saveTx(id, { ...data, updatedAt: now });
     else Store.saveTx(uid(), { ...data, createdAt: now, updatedAt: now });
     toast(id ? 'Updated ✓' : `${data.type === 'income' ? 'Income' : 'Expense'} saved ✓`);
+  },
+  quickDelete(el) {
+    const t = Store.txs.find(x => x.id === el.dataset.id);
+    if (!t) return;
+    if (!confirm(`Delete this entry?\n${t.category} · ${money(t.amount)} · ${fmtShort(t.date)}`)) return;
+    Store.deleteTx(t.id);
+    toast('Deleted');
   },
   deleteTx() {
     const id = sheetState.id;
