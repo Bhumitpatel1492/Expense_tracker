@@ -3,15 +3,15 @@ window.APP_CONFIG = {
   "dataRepo": "Bhumitpatel1492/Expense_tracker_backend",
   "vapidPublicKey": "BEsyCCOiTJnhkaYg2qOfp_zAqmJW-Oq9PVhzicNINqxGdYGyzihKaRSc8_c9telTW_RUxFXDlvZNJ_6x6qVIMXA",
   "auth": {
-    "salt": "Q1Jwg3ovtEOfgQDzLJSW9A==",
+    "salt": "vdg+eO/irHzGWWBuxYwrmw==",
     "iterations": 310000,
     "check": {
-      "iv": "RU1B0ELD2KYsKUW9",
-      "ct": "+rbu2lBW8vjBSAvAgXwbHqeeyjiBlWi2nNcnFUggnU3/uA=="
+      "iv": "mHxrHigPnrVZGGcp",
+      "ct": "GIwV547b6Yp5oWdKjIQeuOzd81oYDkPFgq8N8FE4pJoPmQ=="
     },
     "token": {
-      "iv": "0rlgYDvB4jBoIB5n",
-      "ct": "Va4izIqNrL3hvEBXKowHQuhGvREn2Yrneg=="
+      "iv": "2NzltBEqTtm1IsGA",
+      "ct": "DXIZuxijucZoWvimtmk4jrG9xMQSzbCp4OUwqEYn7LbkJIA0mBNOUvDiIEWTiwtQdV0cnnV0raCtzAKOmpUFKxU3675RaHWdVJkOqyIufyeofav26Z/8nlwqe15t55EmWwFxqrDhImSEhn5Y7A=="
     }
   }
 };
