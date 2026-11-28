@@ -1,6 +1,6 @@
 /* Expense Tracker — multi-user PWA on Firebase.
  * Login: Firebase Auth (mobile number used as the username, password).
- * Data: Firestore, users/{uid} (profile + categories), users/{uid}/books/{id} and users/{uid}/transactions/{id} (with bookId).
+ * Data: Firestore, users/{uid} (profile + categories), books/{id} (shared, with memberUids) and books/{id}/transactions/{id}.
  * Security rules (firebase/firestore.rules) let each user read and write only their own data.
  * Reminders: Firebase Cloud Messaging tokens in users/{uid}/devices, sent by a GitHub Actions job. */
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
@@ -9,7 +9,8 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, getDoc, setDoc, updateDoc, deleteDoc, collection, onSnapshot, writeBatch,
+  doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, collection, onSnapshot, writeBatch,
+  query, where, arrayUnion, arrayRemove, deleteField,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getMessaging, getToken, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
 
@@ -71,23 +72,44 @@ const PAY_MODES = ['UPI', 'Cash', 'Card', 'Bank'];
 const PERIODS = { day: 'Date', month: 'Month', year: 'Year', range: 'Range', all: 'All' };
 
 /* ---------------- Firestore store ---------------- */
-const DEFAULT_BOOK = 'personal'; // entries saved before books existed belong here
-const bookOf = t => t.bookId || DEFAULT_BOOK;
+// Books live at books/{bookId} with a member list, so a book can be shared:
+//   books/{bookId}: { name, ownerUid, ownerName, memberUids: [uid…], members: { uid: { name, mobile, role } } }
+//   books/{bookId}/transactions/{id}: { type, amount, category, party, mode, note, date, createdBy, createdByName, … }
+// mobiles/{mobile}: { uid, name } lets a book owner add a member by mobile number.
 const Store = {
-  uid: null, profile: null, allTxs: [], books: [], bookId: DEFAULT_BOOK,
-  status: 'idle', error: '', unsubs: [], pending: false,
-  get txs() { return this.allTxs.filter(t => bookOf(t) === this.bookId); },
-  get book() { return this.books.find(b => b.id === this.bookId) || { id: this.bookId, name: 'Personal' }; },
+  uid: null, profile: null, books: [], bookTx: {}, bookId: null,
+  status: 'idle', error: '', unsubs: [], txUnsubs: new Map(), pending: false, ready: false,
+  get allTxs() { return Object.values(this.bookTx).flat(); },
+  get txs() { return this.bookTx[this.bookId] || []; },
+  get book() { return this.books.find(b => b.id === this.bookId) || { id: this.bookId, name: 'Book', memberUids: [this.uid], ownerUid: this.uid }; },
+  isOwner(b = this.book) { return b.ownerUid === this.uid; },
+  isShared(b = this.book) { return (b.memberUids || []).length > 1; },
+  me() { const p = this.profile || {}; return { name: p.name || 'Me', mobile: p.mobile || '' }; },
   setBook(id) {
     this.bookId = id;
     ls.set(`et_book_${this.uid}`, id);
     refreshView();
   },
-  bookRef(id) { return doc(db, 'users', this.uid, 'books', id); },
-  saveBook(id, name) { setDoc(this.bookRef(id), { name, updatedAt: Date.now() }, { merge: true }).catch(e => this.fail(e)); },
-  async deleteBook(id) {
-    // Delete the book and all of its entries (in batches; Firestore allows 500 writes per batch).
-    const refs = this.allTxs.filter(t => bookOf(t) === id).map(t => this.txRef(t.id));
+  bookRef(id) { return doc(db, 'books', id); },
+  txRef(id, bookId = this.bookId) { return doc(db, 'books', bookId, 'transactions', id); },
+  userRef() { return doc(db, 'users', this.uid); },
+
+  newBookData(name) {
+    const me = this.me();
+    return {
+      name, ownerUid: this.uid, ownerName: me.name, memberUids: [this.uid],
+      members: { [this.uid]: { name: me.name, mobile: me.mobile, role: 'owner' } },
+      createdAt: Date.now(), updatedAt: Date.now(),
+    };
+  },
+  createBook(name, id = uid()) {
+    setDoc(this.bookRef(id), this.newBookData(name)).catch(e => this.fail(e));
+    return id;
+  },
+  renameBook(id, name) { updateDoc(this.bookRef(id), { name, updatedAt: Date.now() }).catch(e => this.fail(e)); },
+  deleteBook(id) {
+    // Owner only: delete the book and all its entries (batches of max 500 writes).
+    const refs = (this.bookTx[id] || []).map(t => this.txRef(t.id, id));
     refs.push(this.bookRef(id));
     for (let i = 0; i < refs.length; i += 450) {
       const batch = writeBatch(db);
@@ -95,6 +117,127 @@ const Store = {
       batch.commit().catch(e => this.fail(e));
     }
   },
+  async addMember(bookId, mobile) {
+    const snap = await getDoc(doc(db, 'mobiles', mobile));
+    if (!snap.exists()) throw new Error('No user with this mobile number. Ask them to sign up in the app first.');
+    const { uid: memberUid, name } = snap.data();
+    await updateDoc(this.bookRef(bookId), {
+      memberUids: arrayUnion(memberUid),
+      [`members.${memberUid}`]: { name: name || mobile, mobile, role: 'member' },
+      updatedAt: Date.now(),
+    });
+    return name || mobile;
+  },
+  removeMember(bookId, memberUid) {
+    return updateDoc(this.bookRef(bookId), { memberUids: arrayRemove(memberUid), [`members.${memberUid}`]: deleteField(), updatedAt: Date.now() });
+  },
+
+  async start(uid, profile) {
+    this.stop();
+    this.uid = uid;
+    this.profile = profile;
+    this.bookId = ls.get(`et_book_${uid}`);
+    this.setStatus(navigator.onLine ? 'saving' : 'offline');
+    this.unsubs.push(onSnapshot(this.userRef(), snap => {
+      if (snap.exists()) { this.profile = snap.data(); refreshView(); }
+    }, err => this.fail(err)));
+    await this.ensureMobileLookup().catch(e => console.warn('mobile lookup', e));
+    await this.migrateOldData().catch(e => console.warn('migration', e));
+    if (this.uid !== uid) return; // logged out meanwhile
+    this.unsubs.push(onSnapshot(query(collection(db, 'books'), where('memberUids', 'array-contains', uid)), snap => {
+      this.books = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || String(a.name).localeCompare(b.name));
+      if (!this.books.length && !snap.metadata.fromCache) {
+        // First book (fixed id, so two phones can't create two).
+        setDoc(this.bookRef(`${uid}-personal`), { ...this.newBookData('Personal'), createdAt: 0 }).catch(e => this.fail(e));
+      }
+      if (this.books.length && !this.books.some(b => b.id === this.bookId)) this.bookId = this.books[0].id;
+      this.syncTxListeners();
+      this.ready = true;
+      refreshView();
+      // Keep an open Members screen in step with the member list.
+      if (sheetState && sheetState.kind === 'share') {
+        if (this.books.some(b => b.id === sheetState.id)) {
+          const typed = $('#fMemberMobile') ? $('#fMemberMobile').value : '';
+          const msg = $('#fErr') ? $('#fErr').textContent : '';
+          openShareSheet(sheetState.id);
+          if ($('#fMemberMobile')) $('#fMemberMobile').value = typed;
+          if ($('#fErr')) $('#fErr').textContent = msg;
+        } else closeSheet();
+      }
+    }, err => this.fail(err)));
+  },
+  // One live listener per book the user can see.
+  syncTxListeners() {
+    const ids = new Set(this.books.map(b => b.id));
+    for (const [id, un] of this.txUnsubs) if (!ids.has(id)) { un(); this.txUnsubs.delete(id); delete this.bookTx[id]; }
+    for (const id of ids) {
+      if (this.txUnsubs.has(id)) continue;
+      this.txUnsubs.set(id, onSnapshot(collection(db, 'books', id, 'transactions'), { includeMetadataChanges: true }, snap => {
+        this.bookTx[id] = snap.docs.map(d => ({ id: d.id, bookId: id, ...d.data() }));
+        this.pending = snap.metadata.hasPendingWrites;
+        this.setStatus(!navigator.onLine ? 'offline' : this.pending || snap.metadata.fromCache ? 'saving' : 'synced');
+        refreshView();
+      }, err => this.fail(err)));
+    }
+  },
+  async ensureMobileLookup() {
+    const p = this.profile;
+    if (!p || !p.mobile) return;
+    const ref = doc(db, 'mobiles', p.mobile);
+    const snap = await getDoc(ref);
+    if (!snap.exists() || snap.data().uid !== this.uid || snap.data().name !== p.name) await setDoc(ref, { uid: this.uid, name: p.name || '' });
+  },
+  // Version 2 kept books and entries under users/{uid}; copy them once into shareable books.
+  async migrateOldData() {
+    if (!this.profile || this.profile.booksV3) return;
+    const [oldBooks, oldTxs] = await Promise.all([
+      getDocs(collection(db, 'users', this.uid, 'books')),
+      getDocs(collection(db, 'users', this.uid, 'transactions')),
+    ]);
+    const me = this.me();
+    const books = oldBooks.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (oldTxs.size && !books.some(b => b.id === 'personal')) books.push({ id: 'personal', name: 'Personal', createdAt: 0 });
+    const writes = [];
+    for (const b of books) {
+      const newId = b.id === 'personal' ? `${this.uid}-personal` : `${this.uid}-${b.id}`;
+      writes.push([this.bookRef(newId), { ...this.newBookData(b.name || 'Book'), createdAt: b.createdAt || 0 }]);
+      for (const t of oldTxs.docs) {
+        const data = t.data();
+        if ((data.bookId || 'personal') !== b.id) continue;
+        const { bookId, ...rest } = data;
+        writes.push([this.txRef(t.id, newId), { ...rest, createdBy: this.uid, createdByName: me.name }]);
+      }
+    }
+    // Books first (the entries' security rule checks the book's member list), then entries.
+    const bookWrites = writes.filter(([r]) => r.path.split('/').length === 2);
+    const txWrites = writes.filter(([r]) => r.path.split('/').length > 2);
+    for (const group of [bookWrites, txWrites]) {
+      for (let i = 0; i < group.length; i += 450) {
+        const batch = writeBatch(db);
+        group.slice(i, i + 450).forEach(([r, v]) => batch.set(r, v));
+        await batch.commit();
+      }
+    }
+    await updateDoc(this.userRef(), { booksV3: true });
+    this.profile = { ...this.profile, booksV3: true };
+  },
+  stop() {
+    this.unsubs.forEach(u => u());
+    this.txUnsubs.forEach(u => u());
+    this.unsubs = [];
+    this.txUnsubs = new Map();
+    this.uid = null;
+    this.profile = null;
+    this.books = [];
+    this.bookTx = {};
+    this.ready = false;
+  },
+  fail(err) {
+    console.error(err);
+    this.setStatus('error', err.code === 'permission-denied' ? 'You do not have access to this data' : err.message);
+  },
+  setStatus(s, err = '') { this.status = s; this.error = err; updateSyncBadge(); },
   get doc() {
     const c = (this.profile && this.profile.categories) || {};
     return {
@@ -105,48 +248,6 @@ const Store = {
       transactions: this.txs, // current book only
     };
   },
-  userRef() { return doc(db, 'users', this.uid); },
-  txRef(id) { return doc(db, 'users', this.uid, 'transactions', id); },
-
-  start(uid, profile) {
-    this.stop();
-    this.uid = uid;
-    this.profile = profile;
-    this.bookId = ls.get(`et_book_${uid}`) || DEFAULT_BOOK;
-    this.setStatus(navigator.onLine ? 'saving' : 'offline');
-    this.unsubs.push(onSnapshot(collection(db, 'users', uid, 'books'), snap => {
-      this.books = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || a.name.localeCompare(b.name));
-      if (!this.books.length && !snap.metadata.fromCache) {
-        // First time: create the default book (fixed id, so two phones can't create two).
-        setDoc(this.bookRef(DEFAULT_BOOK), { name: 'Personal', createdAt: 0 }, { merge: true }).catch(e => this.fail(e));
-      }
-      if (this.books.length && !this.books.some(b => b.id === this.bookId)) this.bookId = this.books[0].id;
-      refreshView();
-    }, err => this.fail(err)));
-    this.unsubs.push(onSnapshot(this.userRef(), snap => {
-      if (snap.exists()) { this.profile = snap.data(); refreshView(); }
-    }, err => this.fail(err)));
-    this.unsubs.push(onSnapshot(collection(db, 'users', uid, 'transactions'), { includeMetadataChanges: true }, snap => {
-      this.allTxs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      this.pending = snap.metadata.hasPendingWrites;
-      this.setStatus(!navigator.onLine ? 'offline' : this.pending || snap.metadata.fromCache ? 'saving' : 'synced');
-      refreshView();
-    }, err => this.fail(err)));
-  },
-  stop() {
-    this.unsubs.forEach(u => u());
-    this.unsubs = [];
-    this.uid = null;
-    this.profile = null;
-    this.allTxs = [];
-    this.books = [];
-  },
-  fail(err) {
-    console.error(err);
-    this.setStatus('error', err.code === 'permission-denied' ? 'This account is not allowed to access data' : err.message);
-  },
-  setStatus(s, err = '') { this.status = s; this.error = err; updateSyncBadge(); },
 
   // Writes are applied locally at once (offline-safe) and synced by Firestore in the background.
   saveTx(id, data) { setDoc(this.txRef(id), data, { merge: true }).catch(e => this.fail(e)); },
@@ -157,6 +258,26 @@ const Store = {
     updateDoc(this.userRef(), { [`categories.${type}`]: list }).catch(e => this.fail(e));
   },
 };
+
+// Running balance (#1): balance after each entry, oldest first, per book.
+const balanceCache = new WeakMap();
+function runningBalances(list) {
+  if (balanceCache.has(list)) return balanceCache.get(list);
+  const sorted = [...list].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0)));
+  const map = new Map();
+  let bal = 0;
+  for (const t of sorted) { bal += (t.type === 'income' ? 1 : -1) * Number(t.amount || 0); map.set(t.id, bal); }
+  balanceCache.set(list, map);
+  return map;
+}
+function bookTotals(id) {
+  const list = Store.bookTx[id] || [];
+  const inc = sum(list.filter(t => t.type === 'income'));
+  const exp = sum(list.filter(t => t.type === 'expense'));
+  const last = list.reduce((m, t) => Math.max(m, t.updatedAt || t.createdAt || 0), 0);
+  return { inc, exp, bal: inc - exp, count: list.length, last };
+}
+const signed = n => `${n < 0 ? '−' : ''}${money(Math.abs(n))}`;
 
 function updateSyncBadge() {
   const b = $('#syncBadge');
@@ -180,7 +301,7 @@ function refreshView() {
 /* ---------------- UI state ---------------- */
 const newFilter = () => ({ period: 'month', day: today(), month: thisMonth(), year: thisYear(), from: thisMonth() + '-01', to: today(), category: 'all', q: '' });
 const ui = {
-  tab: 'dashboard',
+  tab: 'books',
   dashMonth: thisMonth(),
   filters: { income: newFilter(), expense: newFilter() },
   catType: 'expense',
@@ -206,7 +327,7 @@ function filtered(type, f) {
   const q = f.q.trim().toLowerCase();
   return Store.txs.filter(t => t.type === type && inPeriod(t.date, f) &&
     (f.category === 'all' || t.category === f.category) &&
-    (!q || `${t.note || ''} ${t.category} ${t.mode || ''}`.toLowerCase().includes(q))).sort(byNewest);
+    (!q || `${t.note || ''} ${t.category} ${t.mode || ''} ${t.party || ''} ${t.createdByName || ''}`.toLowerCase().includes(q))).sort(byNewest);
 }
 function periodLabel(f) {
   switch (f.period) {
@@ -224,21 +345,63 @@ function byCategory(list) {
 }
 
 /* ---------------- views ---------------- */
-const TITLES = { dashboard: 'Dashboard', income: 'Income', expense: 'Expense', settings: 'Settings' };
+const TITLES = { books: 'My Books', dashboard: 'Dashboard', income: 'Income', expense: 'Expense', settings: 'Settings' };
 
 // Book switcher shown above Dashboard / Income / Expense (like CashBook's books).
 function bookBar() {
   const books = Store.books.length ? Store.books : [Store.book];
   return `<div class="bookbar" role="tablist" aria-label="Books">
-    ${books.map(b => `<button class="book-chip${b.id === Store.bookId ? ' on' : ''}" data-action="pickBook" data-id="${esc(b.id)}" type="button">📒 ${esc(b.name)}</button>`).join('')}
+    ${books.map(b => `<button class="book-chip${b.id === Store.bookId ? ' on' : ''}" data-action="pickBook" data-id="${esc(b.id)}" type="button">${Store.isShared(b) ? '👥' : '📒'} ${esc(b.name)}</button>`).join('')}
     <button class="book-chip add" data-action="newBook" type="button">+ New book</button>
   </div>`;
+}
+
+// Home screen (#2): every book with its balance, like CashBook's book list.
+function timeAgo(ms) {
+  if (!ms || ms < 1e12) return ''; // unknown time
+  const s = (Date.now() - ms) / 1000;
+  if (s < 60) return 'Updated just now';
+  if (s < 3600) return `Updated ${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `Updated ${Math.floor(s / 3600)} h ago`;
+  return `Updated ${new Date(ms).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+}
+function viewBooks() {
+  if (!Store.ready) return '<div class="empty"><div class="em">📒</div>Loading your books…</div>';
+  const all = Store.books.map(b => ({ b, t: bookTotals(b.id) }));
+  const inc = all.reduce((s, x) => s + x.t.inc, 0);
+  const exp = all.reduce((s, x) => s + x.t.exp, 0);
+  return `
+    <section class="card hero">
+      <div class="label">All books · Net balance</div>
+      <div class="big">${signed(inc - exp)}</div>
+      <div class="hero-split">
+        <div><span>Total in</span><b>${money(inc)}</b></div>
+        <div><span>Total out</span><b>${money(exp)}</b></div>
+      </div>
+    </section>
+    <h3 class="section-title">Your books <small>${all.length}</small></h3>
+    <div class="book-list">
+      ${all.map(({ b, t }) => {
+        const shared = Store.isShared(b);
+        const who = !Store.isOwner(b) ? `Shared by ${esc(b.ownerName || 'owner')}` : shared ? `Shared with ${(b.memberUids || []).length - 1}` : '';
+        const when = t.count ? timeAgo(t.last) : 'No entries yet';
+        const line = [who, who ? when.replace('Updated ', '') : when].filter(Boolean).join(' · ');
+        return `<button class="book-card${b.id === Store.bookId ? ' on' : ''}" data-action="openBook" data-id="${esc(b.id)}" type="button">
+          <span class="book-ic">${shared ? '👥' : '📒'}</span>
+          <span class="book-mid"><b>${esc(b.name)}</b>${line ? `<small>${line}</small>` : ''}
+            <small class="book-io"><span class="in">In ${money(t.inc)}</span> · <span class="out">Out ${money(t.exp)}</span></small></span>
+          <span class="book-bal ${t.bal < 0 ? 'neg' : 'pos'}">${signed(t.bal)}<small>${t.count} ${t.count === 1 ? 'entry' : 'entries'}</small></span>
+        </button>`;
+      }).join('')}
+    </div>
+    <button class="btn ghost block" style="margin-top:4px" data-action="newBook" type="button">+ Add new book</button>`;
 }
 
 function render() {
   const v = $('#view');
   if (!v) return;
-  if (ui.tab === 'dashboard') v.innerHTML = bookBar() + viewDashboard();
+  if (ui.tab === 'books') v.innerHTML = viewBooks();
+  else if (ui.tab === 'dashboard') v.innerHTML = bookBar() + viewDashboard();
   else if (ui.tab === 'income' || ui.tab === 'expense') { v.innerHTML = bookBar() + viewTxnTab(ui.tab); renderResults(ui.tab); }
   else { v.innerHTML = viewSettings(); fillReminderStatus(); }
   $('#pageTitle').textContent = TITLES[ui.tab];
@@ -248,13 +411,16 @@ function render() {
 }
 
 function txRow(t) {
-  const sub = [t.mode && t.type === 'expense' ? t.mode : '', t.note || ''].filter(Boolean).join(' · ');
+  const party = t.party ? `${t.type === 'income' ? 'From' : 'To'} ${t.party}` : '';
+  const by = Store.isShared() && t.createdBy && t.createdBy !== Store.uid ? `by ${t.createdByName || 'member'}` : '';
+  const sub = [party, t.mode && t.type === 'expense' ? t.mode : '', t.note || '', by].filter(Boolean).join(' · ');
   const id = esc(t.id);
+  const bal = runningBalances(Store.txs).get(t.id);
   return `<div class="tx ${t.type}">
     <button class="tx-main" data-action="edit" data-id="${id}" type="button">
       <span class="ic">${icon(t.category)}</span>
       <span class="mid"><b>${esc(t.category)}</b>${sub ? `<small>${esc(sub)}</small>` : ''}</span>
-      <span class="amt">${t.type === 'income' ? '+' : '−'}${money(t.amount)}</span>
+      <span class="amt">${t.type === 'income' ? '+' : '−'}${money(t.amount)}${bal !== undefined ? `<small class="run-bal">Bal ${signed(bal)}</small>` : ''}</span>
     </button>
     <span class="tx-actions">
       <button class="tx-btn" data-action="edit" data-id="${id}" type="button" aria-label="Edit entry" title="Edit">
@@ -327,6 +493,11 @@ function viewDashboard() {
         <div class="muted" style="font-size:13px">${todayExp.length} ${todayExp.length === 1 ? 'entry' : 'entries'}</div>
       </div>
       <button class="btn primary" data-action="add" data-type="expense" type="button">+ Add expense</button>
+    </section>
+
+    <section class="card today-card">
+      <div><b>📄 Reports</b><div class="muted" style="font-size:13px">Download this book as PDF or Excel</div></div>
+      <button class="btn ghost" data-action="openReport" type="button">Download</button>
     </section>
 
     <section class="card">
@@ -450,14 +621,16 @@ function viewSettings() {
       <h3>Books <small>${Store.books.length} ${Store.books.length === 1 ? 'book' : 'books'}</small></h3>
       <div class="cat-list">
         ${Store.books.map(b => {
-          const list = Store.allTxs.filter(t => bookOf(t) === b.id);
-          const bal = sum(list.filter(t => t.type === 'income')) - sum(list.filter(t => t.type === 'expense'));
+          const t = bookTotals(b.id);
+          const owner = Store.isOwner(b);
           return `<div class="cat-item">
-            <span>📒</span>
+            <span>${Store.isShared(b) ? '👥' : '📒'}</span>
             <span class="n">${esc(b.name)}${b.id === Store.bookId ? ' <span class="pill on">Open</span>' : ''}
-              <small class="muted" style="display:block">${list.length} ${list.length === 1 ? 'entry' : 'entries'} · balance ${bal < 0 ? '−' : ''}${money(Math.abs(bal))}</small></span>
-            <button class="x" data-action="editBook" data-id="${esc(b.id)}" type="button" aria-label="Rename ${esc(b.name)}">✏️</button>
-            <button class="x" data-action="delBook" data-id="${esc(b.id)}" type="button" aria-label="Delete ${esc(b.name)}">🗑</button>
+              <small class="muted" style="display:block">${owner ? '' : `Shared by ${esc(b.ownerName || 'owner')} · `}${t.count} ${t.count === 1 ? 'entry' : 'entries'} · balance ${signed(t.bal)}</small></span>
+            <button class="x" data-action="shareBook" data-id="${esc(b.id)}" type="button" aria-label="Members of ${esc(b.name)}" title="Members">👥</button>
+            ${owner ? `<button class="x" data-action="editBook" data-id="${esc(b.id)}" type="button" aria-label="Rename ${esc(b.name)}" title="Rename">✏️</button>
+            <button class="x" data-action="delBook" data-id="${esc(b.id)}" type="button" aria-label="Delete ${esc(b.name)}" title="Delete">🗑</button>`
+            : `<button class="x" data-action="leaveBook" data-id="${esc(b.id)}" type="button" aria-label="Leave ${esc(b.name)}" title="Leave book">🚪</button>`}
           </div>`;
         }).join('')}
       </div>
@@ -482,14 +655,15 @@ function viewSettings() {
 
     <section class="card">
       <h3>Data &amp; sync</h3>
-      <div class="set-row"><div>Storage<small>Private cloud (Firebase) · only you can see it</small></div></div>
+      <div class="set-row"><div>Storage<small>Private cloud (Firebase) · only you and people you share a book with</small></div></div>
       <div class="set-row"><div>Status<small>${esc(syncText)}</small></div></div>
-      <div class="set-row"><div>Entries<small>${Store.txs.length} total</small></div><button class="btn ghost" data-action="exportCsv" type="button">Export CSV</button></div>
+      <div class="set-row"><div>Reports<small>${esc(Store.book.name)} · ${Store.txs.length} entries</small></div><button class="btn ghost" data-action="openReport" type="button">📄 PDF / Excel</button></div>
+      <div class="set-row"><div>Export<small>Spreadsheet (CSV) of this book</small></div><button class="btn ghost" data-action="exportCsv" type="button">Export CSV</button></div>
       ${Store.error ? `<p class="error">${esc(Store.error)}</p>` : ''}
     </section>
 
     <button class="btn danger block" data-action="logout" type="button">Logout</button>
-    <p class="note" style="text-align:center">Expense Tracker · v2.0</p>`;
+    <p class="note" style="text-align:center">Expense Tracker · v3.0</p>`;
 }
 
 /* ---------------- add / edit sheet ---------------- */
@@ -502,6 +676,7 @@ function openSheet(type = 'expense', tx = null) {
     date: tx ? tx.date : today(),
     note: tx ? tx.note || '' : '',
     mode: tx ? tx.mode || 'UPI' : 'UPI',
+    party: tx ? tx.party || '' : '',
     addingCat: false,
   };
   renderSheet();
@@ -523,11 +698,147 @@ function openBookSheet(book = null) {
   $('#sheetWrap').classList.remove('hidden');
   setTimeout(() => $('#fBookName') && $('#fBookName').focus(), 250);
 }
+// Members of a book (#3).
+function openShareSheet(bookId) {
+  const b = Store.books.find(x => x.id === bookId);
+  if (!b) return;
+  sheetState = { kind: 'share', id: bookId };
+  const owner = Store.isOwner(b);
+  const members = Object.entries(b.members || {}).sort((x, y) => (x[1].role === 'owner' ? -1 : 1) - (y[1].role === 'owner' ? -1 : 1));
+  $('#sheet').innerHTML = `
+    <div class="grab"></div>
+    <h2>👥 ${esc(b.name)} <button class="icon-btn" data-action="closeSheet" type="button" aria-label="Close">✕</button></h2>
+    <p class="muted" style="margin:-6px 0 12px;font-size:14px">Members can see this book and add, edit or delete its entries. Only the owner can add or remove members.</p>
+    <div class="cat-list">
+      ${members.map(([mid, m]) => `<div class="cat-item">
+        <span>${m.role === 'owner' ? '👑' : '👤'}</span>
+        <span class="n">${esc(m.name || '')}${mid === Store.uid ? ' (you)' : ''}<small class="muted" style="display:block">${esc(m.mobile || '')} · ${m.role === 'owner' ? 'Owner' : 'Member'}</small></span>
+        ${owner && m.role !== 'owner' ? `<button class="x" data-action="removeMemberBtn" data-uid="${esc(mid)}" type="button" aria-label="Remove ${esc(m.name || '')}">✕</button>` : ''}
+      </div>`).join('')}
+    </div>
+    ${owner ? `<p class="label-sm" style="margin-top:14px">Add member by mobile number</p>
+      <div class="add-row" style="margin-top:0"><input id="fMemberMobile" type="tel" inputmode="numeric" maxlength="10" placeholder="10 digit mobile"><button class="btn primary" data-action="addMemberForm" type="button">Add</button></div>
+      <p class="note">They must have an account in this app (signed up with the invite code).</p>` : ''}
+    <p id="fErr" class="error"></p>`;
+  $('#sheetWrap').classList.remove('hidden');
+}
+
+// Reports (#5): PDF (via the phone's "Save as PDF" print option) and Excel (.xlsx).
+const REPORT_PERIODS = { month: 'This month', last: 'Last month', year: 'This year', all: 'All time', custom: 'Custom' };
+function openReportSheet() {
+  sheetState = { kind: 'report', period: 'month', from: thisMonth() + '-01', to: today() };
+  renderReportSheet();
+  $('#sheetWrap').classList.remove('hidden');
+}
+function renderReportSheet() {
+  const s = sheetState;
+  $('#sheet').innerHTML = `
+    <div class="grab"></div>
+    <h2>📄 Report <button class="icon-btn" data-action="closeSheet" type="button" aria-label="Close">✕</button></h2>
+    <p class="muted" style="margin:-6px 0 12px;font-size:14px">Book: <b>${esc(Store.book.name)}</b></p>
+    <p class="label-sm">Period</p>
+    <div class="chips">${Object.entries(REPORT_PERIODS).map(([k, l]) => `<button class="chip${s.period === k ? ' on' : ''}" data-action="reportPeriod" data-p="${k}" type="button">${l}</button>`).join('')}</div>
+    ${s.period === 'custom' ? `<div class="filter-row">
+      <input id="rFrom" type="date" value="${s.from}" max="${today()}" aria-label="From"><span class="range-sep">to</span>
+      <input id="rTo" type="date" value="${s.to}" max="${today()}" aria-label="To"></div>` : ''}
+    <p id="fErr" class="error"></p>
+    <div class="sheet-actions">
+      <button class="btn primary" data-action="reportPdf" type="button">⬇ PDF</button>
+      <button class="btn primary" data-action="reportExcel" type="button">⬇ Excel</button>
+    </div>
+    <p class="note">PDF opens the print screen: choose <b>Save as PDF</b>.</p>`;
+}
+function readReport() {
+  const f = $('#rFrom'), t = $('#rTo');
+  if (f) sheetState.from = f.value;
+  if (t) sheetState.to = t.value;
+}
+function reportData() {
+  const s = sheetState;
+  let from = '', to = today(), label = REPORT_PERIODS[s.period];
+  if (s.period === 'month') { from = thisMonth() + '-01'; label = fmtMonth(thisMonth()); }
+  if (s.period === 'last') { const m = shiftMonth(thisMonth(), -1); from = m + '-01'; to = shiftDay(thisMonth() + '-01', -1); label = fmtMonth(m); }
+  if (s.period === 'year') { from = thisYear() + '-01-01'; label = thisYear(); }
+  if (s.period === 'custom') {
+    from = s.from; to = s.to;
+    if (!from || !to) { $('#fErr').textContent = 'Choose both dates'; return null; }
+    if (from > to) { $('#fErr').textContent = '"From" date must be before "To" date'; return null; }
+    if (to > today()) { $('#fErr').textContent = 'Future dates are not allowed'; return null; }
+    label = `${fmtShort(from)} – ${fmtShort(to)}`;
+  }
+  const bal = runningBalances(Store.txs);
+  const rows = Store.txs.filter(t => (!from || t.date >= from) && t.date <= to)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt || 0) - (b.createdAt || 0)));
+  if (!rows.length) { $('#fErr').textContent = 'No entries in this period'; return null; }
+  const inc = sum(rows.filter(t => t.type === 'income'));
+  const exp = sum(rows.filter(t => t.type === 'expense'));
+  return { book: Store.book.name, label, rows, inc, exp, bal };
+}
+const fileSafe = s => String(s).replace(/[^\w-]+/g, '-').replace(/^-|-$/g, '');
+function printReport(r) {
+  const shared = Store.isShared();
+  const area = $('#printArea') || document.body.appendChild(Object.assign(document.createElement('div'), { id: 'printArea' }));
+  area.innerHTML = `
+    <h1>${esc(r.book)}</h1>
+    <p class="rp-sub">Report · ${esc(r.label)} · Generated ${new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</p>
+    <table class="rp-sum"><tr><td>Total in<b class="in">${money(r.inc)}</b></td><td>Total out<b class="out">${money(r.exp)}</b></td><td>Net<b>${signed(r.inc - r.exp)}</b></td><td>Entries<b>${r.rows.length}</b></td></tr></table>
+    <table class="rp-table">
+      <thead><tr><th>Date</th><th>Details</th><th>Mode</th>${shared ? '<th>By</th>' : ''}<th class="num">In</th><th class="num">Out</th><th class="num">Balance</th></tr></thead>
+      <tbody>${r.rows.map(t => `<tr>
+        <td>${fmtShort(t.date)}</td>
+        <td><b>${esc(t.category)}</b>${t.party ? `<br>${t.type === 'income' ? 'From' : 'To'} ${esc(t.party)}` : ''}${t.note ? `<br><i>${esc(t.note)}</i>` : ''}</td>
+        <td>${t.type === 'expense' ? esc(t.mode || '') : ''}</td>${shared ? `<td>${esc(t.createdByName || '')}</td>` : ''}
+        <td class="num in">${t.type === 'income' ? money(t.amount) : ''}</td>
+        <td class="num out">${t.type === 'expense' ? money(t.amount) : ''}</td>
+        <td class="num">${signed(r.bal.get(t.id))}</td></tr>`).join('')}</tbody>
+    </table>`;
+  const oldTitle = document.title;
+  document.title = `${fileSafe(r.book)}-report-${fileSafe(r.label)}`; // used as the PDF file name
+  document.body.classList.add('printing');
+  const done = () => { document.body.classList.remove('printing'); document.title = oldTitle; window.removeEventListener('afterprint', done); };
+  window.addEventListener('afterprint', done);
+  setTimeout(() => window.print(), 50);
+}
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if (document.querySelector(`script[src="${src}"]`)) return res();
+    const el = Object.assign(document.createElement('script'), { src, onload: res, onerror: () => rej(new Error('Could not load (check internet)')) });
+    document.head.appendChild(el);
+  });
+}
+async function excelReport(r, btn) {
+  btn.disabled = true;
+  try {
+    await loadScript('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js');
+    const shared = Store.isShared();
+    const head = ['Date', 'Category', 'Party', 'Mode', 'Note', ...(shared ? ['Added by'] : []), 'In', 'Out', 'Balance'];
+    const aoa = [
+      [`${r.book} — ${r.label}`], [],
+      ['Total in', r.inc], ['Total out', r.exp], ['Net', r.inc - r.exp], ['Entries', r.rows.length], [],
+      head,
+      ...r.rows.map(t => [t.date, t.category, t.party || '', t.type === 'expense' ? t.mode || '' : '', t.note || '',
+        ...(shared ? [t.createdByName || ''] : []),
+        t.type === 'income' ? Number(t.amount) : '', t.type === 'expense' ? Number(t.amount) : '', r.bal.get(t.id)]),
+    ];
+    const ws = window.XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = head.map(h => ({ wch: h === 'Note' ? 28 : h === 'Category' || h === 'Party' ? 18 : 12 }));
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, 'Report');
+    window.XLSX.writeFile(wb, `${fileSafe(r.book)}-report-${fileSafe(r.label)}.xlsx`);
+    toast('Excel downloaded ✓');
+  } catch (e) {
+    $('#fErr') && ($('#fErr').textContent = 'Excel failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function readSheet() {
   if (!sheetState) return;
   const a = $('#fAmount'); if (a) sheetState.amount = a.value;
   const d = $('#fDate'); if (d) sheetState.date = d.value;
   const n = $('#fNote'); if (n) sheetState.note = n.value;
+  const p = $('#fParty'); if (p) sheetState.party = p.value;
 }
 function renderSheet() {
   const s = sheetState;
@@ -548,6 +859,8 @@ function renderSheet() {
     ${s.addingCat ? `<div class="new-cat"><input id="fNewCat" maxlength="30" placeholder="Category name"><button class="btn primary" data-action="saveNewCat" type="button">Add</button></div>` : ''}
     ${s.type === 'expense' ? `<p class="label-sm">Paid by</p>
       <div class="chips">${PAY_MODES.map(m => `<button class="chip${m === s.mode ? ' on' : ''}" data-action="pickMode" data-m="${m}" type="button">${m}</button>`).join('')}</div>` : ''}
+    <label class="field"><span>${s.type === 'income' ? 'Received from' : 'Paid to'} (optional)</span><input id="fParty" list="partyList" maxlength="40" autocomplete="off" placeholder="${s.type === 'income' ? 'e.g. Company, client' : 'e.g. Shop name, person'}" value="${esc(s.party)}"></label>
+    <datalist id="partyList">${[...new Set(Store.allTxs.map(t => t.party).filter(Boolean))].sort().map(p => `<option value="${esc(p)}">`).join('')}</datalist>
     <label class="field"><span>Date</span><input id="fDate" type="date" value="${s.date}" max="${today()}"></label>
     <label class="field"><span>Note (optional)</span><input id="fNote" maxlength="120" placeholder="e.g. Lunch with friends" value="${esc(s.note)}"></label>
     <p id="fErr" class="error"></p>
@@ -623,8 +936,9 @@ async function testNotif() {
 }
 
 function exportCsv() {
-  const rows = [['Date', 'Type', 'Category', 'Amount', 'Paid by', 'Note']];
-  for (const t of [...Store.txs].sort(byNewest)) rows.push([t.date, t.type, t.category, t.amount, t.type === 'expense' ? t.mode || '' : '', t.note || '']);
+  const bal = runningBalances(Store.txs);
+  const rows = [['Date', 'Type', 'Category', 'Party', 'Amount', 'Mode', 'Note', 'Added by', 'Balance']];
+  for (const t of [...Store.txs].sort(byNewest)) rows.push([t.date, t.type, t.category, t.party || '', t.amount, t.type === 'expense' ? t.mode || '' : '', t.note || '', t.createdByName || '', bal.get(t.id)]);
   const csv = '﻿' + rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -636,7 +950,10 @@ function exportCsv() {
 
 /* ---------------- actions ---------------- */
 const actions = {
-  add(el) { openSheet(el.dataset.type || (ui.tab === 'income' ? 'income' : 'expense')); },
+  add(el) {
+    if (ui.tab === 'books' && !el.dataset.type) return openBookSheet(); // + on the books screen makes a new book
+    openSheet(el.dataset.type || (ui.tab === 'income' ? 'income' : 'expense'));
+  },
   edit(el) { const t = Store.txs.find(x => x.id === el.dataset.id); if (t) openSheet(t.type, t); },
   closeSheet,
   dashMonth(el) {
@@ -687,16 +1004,17 @@ const actions = {
     if (!s.category) { err.textContent = 'Choose a category'; return; }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(s.date)) { err.textContent = 'Choose a date'; return; }
     if (s.date > today()) { err.textContent = 'Future date is not allowed. Choose today or an earlier date.'; $('#fDate').focus(); return; }
-    const data = { type: s.type, amount, category: s.category, date: s.date, note: s.note.trim() };
+    const data = { type: s.type, amount, category: s.category, date: s.date, note: s.note.trim(), party: (s.party || '').trim().replace(/\s+/g, ' ') };
     if (s.type === 'expense') data.mode = s.mode; else data.mode = '';
     const now = Date.now();
     const id = s.id;
     closeSheet();
     if (id) Store.saveTx(id, { ...data, updatedAt: now });
-    else Store.saveTx(uid(), { ...data, bookId: Store.bookId, createdAt: now, updatedAt: now });
+    else Store.saveTx(uid(), { ...data, createdBy: Store.uid, createdByName: Store.me().name, createdAt: now, updatedAt: now });
     toast(id ? 'Updated ✓' : `${data.type === 'income' ? 'Income' : 'Expense'} saved ✓`);
   },
-  pickBook(el) { Store.setBook(el.dataset.id); toast(`Opened 📒 ${Store.book.name}`); },
+  pickBook(el) { Store.setBook(el.dataset.id); toast(`Opened ${Store.book.name}`); },
+  openBook(el) { Store.bookId = el.dataset.id; ls.set(`et_book_${Store.uid}`, el.dataset.id); ui.tab = 'dashboard'; render(); window.scrollTo(0, 0); },
   newBook() { openBookSheet(); },
   editBook(el) { const b = Store.books.find(x => x.id === el.dataset.id); if (b) openBookSheet(b); },
   saveBookForm() {
@@ -704,28 +1022,65 @@ const actions = {
     const err = $('#fErr');
     if (!name) { err.textContent = 'Enter a book name'; return; }
     const id = sheetState.id;
-    if (Store.books.some(b => b.id !== id && b.name.toLowerCase() === name.toLowerCase())) { err.textContent = 'A book with this name already exists'; return; }
+    if (Store.books.some(b => b.id !== id && b.ownerUid === Store.uid && b.name.toLowerCase() === name.toLowerCase())) { err.textContent = 'You already have a book with this name'; return; }
     closeSheet();
     if (id) {
-      Store.saveBook(id, name);
+      Store.renameBook(id, name);
       toast('Book renamed ✓');
     } else {
-      const newId = uid();
-      setDoc(Store.bookRef(newId), { name, createdAt: Date.now() }).catch(e => Store.fail(e));
-      Store.setBook(newId);
+      Store.setBook(Store.createBook(name));
       toast(`📒 ${name} created`);
     }
   },
   delBook(el) {
     const b = Store.books.find(x => x.id === el.dataset.id);
     if (!b) return;
+    if (!Store.isOwner(b)) return toast('Only the owner can delete this book');
     if (Store.books.length <= 1) return toast('Keep at least one book');
-    const n = Store.allTxs.filter(t => bookOf(t) === b.id).length;
-    if (!confirm(`Delete book "${b.name}"?${n ? `\nIts ${n} ${n === 1 ? 'entry' : 'entries'} will also be deleted. This cannot be undone.` : ''}`)) return;
+    const n = (Store.bookTx[b.id] || []).length;
+    const shared = Store.isShared(b) ? '\nIt will also be removed for everyone it is shared with.' : '';
+    if (!confirm(`Delete book "${b.name}"?${n ? `\nIts ${n} ${n === 1 ? 'entry' : 'entries'} will also be deleted.` : ''}${shared}\nThis cannot be undone.`)) return;
     if (b.id === Store.bookId) Store.setBook(Store.books.find(x => x.id !== b.id).id);
     Store.deleteBook(b.id);
     toast('Book deleted');
   },
+  leaveBook(el) {
+    const b = Store.books.find(x => x.id === el.dataset.id);
+    if (!b) return;
+    if (!confirm(`Leave "${b.name}"?\nYou will no longer see this book. ${b.ownerName || 'The owner'} can add you again.`)) return;
+    if (b.id === Store.bookId) { const other = Store.books.find(x => x.id !== b.id); if (other) Store.setBook(other.id); }
+    Store.removeMember(b.id, Store.uid).then(() => toast('You left the book')).catch(e => toast(e.message, 3500));
+  },
+  // Members screen (#3): owner adds people by mobile number; everyone sees who has access.
+  shareBook(el) { openShareSheet(el.dataset.id); },
+  async addMemberForm() {
+    const mobile = ($('#fMemberMobile').value || '').replace(/\D/g, '');
+    const err = $('#fErr');
+    err.textContent = '';
+    if (mobile.length !== 10) { err.textContent = 'Enter a 10 digit mobile number'; return; }
+    if (mobile === Store.me().mobile) { err.textContent = 'That is your own number'; return; }
+    const btn = $('[data-action=addMemberForm]');
+    btn.disabled = true;
+    try {
+      const name = await Store.addMember(sheetState.id, mobile);
+      toast(`${name} can now see and add entries ✓`);
+      $('#fMemberMobile').value = '';
+      btn.disabled = false;
+    } catch (e) {
+      err.textContent = e.code === 'permission-denied' ? 'Only the book owner can add members' : e.message;
+      btn.disabled = false;
+    }
+  },
+  removeMemberBtn(el) {
+    const b = Store.books.find(x => x.id === sheetState.id);
+    const m = b && b.members && b.members[el.dataset.uid];
+    if (!confirm(`Remove ${m ? m.name : 'this member'} from "${b ? b.name : 'book'}"?`)) return;
+    Store.removeMember(sheetState.id, el.dataset.uid).then(() => toast('Member removed')).catch(e => toast(e.message, 3500));
+  },
+  openReport() { openReportSheet(); },
+  reportPeriod(el) { readReport(); sheetState.period = el.dataset.p; renderReportSheet(); },
+  reportPdf() { readReport(); const r = reportData(); if (r) printReport(r); },
+  reportExcel(el) { readReport(); const r = reportData(); if (r) excelReport(r, el); },
   quickDelete(el) {
     const t = Store.txs.find(x => x.id === el.dataset.id);
     if (!t) return;

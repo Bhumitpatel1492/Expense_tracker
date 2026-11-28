@@ -80,7 +80,7 @@ main { max-width: 560px; margin: 0 auto; padding: 16px 16px calc(96px + env(safe
 
 .tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; background: #fff; border-top: 1px solid var(--line);
-  display: grid; grid-template-columns: repeat(4, 1fr); padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+  display: grid; grid-template-columns: repeat(5, 1fr); padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
 }
 .tabbar button { border: 0; background: transparent; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; color: var(--muted); font-size: 11px; font-weight: 600; }
 .tabbar svg { width: 24px; height: 24px; }
@@ -241,3 +241,44 @@ main { max-width: 560px; margin: 0 auto; padding: 16px 16px calc(96px + env(safe
 .book-chip.add { border-style: dashed; border-color: var(--orange-m); color: var(--orange-d); }
 
 .icon-btn:disabled { opacity: .35; cursor: default; }
+
+/* ---------- Books home ---------- */
+.section-title { margin: 18px 4px 10px; font-size: 15px; display: flex; justify-content: space-between; }
+.section-title small { color: var(--muted); font-weight: 500; }
+.book-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.book-card { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; box-shadow: var(--shadow); }
+.book-card.on { border-color: var(--orange-m); }
+.book-card:active { background: var(--soft); }
+.book-ic { width: 44px; height: 44px; border-radius: 12px; background: var(--orange-l); display: grid; place-items: center; font-size: 22px; flex: none; }
+.book-mid { flex: 1; min-width: 0; }
+.book-mid b { display: block; font-size: 16px; }
+.book-mid small { display: block; color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.book-io .in { color: var(--green); }
+.book-io .out { color: var(--orange-d); }
+.book-bal { text-align: right; font-weight: 800; font-size: 16px; white-space: nowrap; }
+.book-bal.pos { color: var(--green); }
+.book-bal.neg { color: var(--red); }
+.book-bal small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
+
+/* running balance under the amount */
+.tx .amt { text-align: right; }
+.tx .amt .run-bal { display: block; font-size: 11.5px; font-weight: 500; color: var(--muted); margin-top: 2px; }
+
+/* ---------- Printable report (PDF) ---------- */
+#printArea { display: none; }
+@media print {
+  body.printing > *:not(#printArea) { display: none !important; }
+  body.printing #printArea { display: block; color: #000; font-size: 11px; }
+  #printArea h1 { margin: 0 0 2px; font-size: 20px; color: #EA580C; }
+  #printArea .rp-sub { margin: 0 0 12px; color: #555; }
+  #printArea table { width: 100%; border-collapse: collapse; }
+  #printArea .rp-sum td { border: 1px solid #ddd; padding: 8px; color: #555; }
+  #printArea .rp-sum b { display: block; font-size: 14px; color: #000; }
+  #printArea .rp-table { margin-top: 12px; }
+  #printArea .rp-table th { background: #FFF1E6; text-align: left; border-bottom: 2px solid #F97316; padding: 6px; }
+  #printArea .rp-table td { border-bottom: 1px solid #eee; padding: 6px; vertical-align: top; }
+  #printArea .num { text-align: right; white-space: nowrap; }
+  #printArea .in { color: #16A34A; }
+  #printArea .out { color: #DC2626; }
+  @page { margin: 12mm; }
+}

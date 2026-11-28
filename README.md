@@ -4,7 +4,10 @@ A simple income and expense tracker for a small group of people (white and orang
 
 - **Dashboard**: monthly balance, income and expense, today's spending, expense by category, and a 6-month trend.
 - **Income / Expense tabs**: filter by date, month, year, date range or all time, plus category and search.
-- **Books**: separate books (e.g. Home, Shop, Trip), each with its own entries and balance; switch at the top, manage in Settings.
+- **Books** (home screen): separate books (e.g. Home, Shop, Trip), each with its own entries and net balance.
+- **Shared books**: the owner adds members by mobile number; members can add, edit and delete entries, and see who added what.
+- **Running balance** on every entry, and **party names** (paid to / received from).
+- **Reports**: PDF (via Save as PDF) and Excel (.xlsx) for this month, last month, this year, all time or a custom range.
 - **Categories**: each user manages their own (Settings, or **+ New** in the add form).
 - **Reminders**: push notifications every day at **6:35 PM, 10:00 PM and 11:00 PM** IST, with each user's own totals.
 - **Works offline**: changes sync when the phone is back online.
@@ -15,8 +18,8 @@ A simple income and expense tracker for a small group of people (white and orang
 |---|---|
 | App (this repo) | GitHub Pages: https://bhumitpatel1492.github.io/Expense_tracker/ |
 | Logins | Firebase Authentication. The mobile number is the username, plus a password. |
-| Data | Cloud Firestore: `users/{uid}` (profile + categories), `users/{uid}/books` (CashBook-style books), `users/{uid}/transactions` (each with a `bookId`), `users/{uid}/devices` |
-| Privacy | `firebase/firestore.rules`: a user can only read and write their own documents |
+| Data | Cloud Firestore: `users/{uid}` (profile, categories, devices), `books/{bookId}` (name, owner, `memberUids`), `books/{bookId}/transactions`, `mobiles/{mobile}` (lookup for adding members) |
+| Privacy | `firebase/firestore.rules`: a book and its entries are visible only to its members; only the owner manages members |
 | Sign-up | Needs the invite code stored in Firestore at `config/app → inviteCode` |
 | Reminders | GitHub Actions cron in the private `Expense_tracker_backend` repo sends Firebase Cloud Messaging pushes |
 
