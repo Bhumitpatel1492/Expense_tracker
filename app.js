@@ -1,6 +1,6 @@
 /* Expense Tracker — multi-user PWA on Firebase.
  * Login: Firebase Auth (mobile number used as the username, password).
- * Data: Firestore, users/{uid} (profile + categories) and users/{uid}/transactions/{id}.
+ * Data: Firestore, users/{uid} (profile + categories), users/{uid}/books/{id} and users/{uid}/transactions/{id} (with bookId).
  * Security rules (firebase/firestore.rules) let each user read and write only their own data.
  * Reminders: Firebase Cloud Messaging tokens in users/{uid}/devices, sent by a GitHub Actions job. */
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
@@ -9,7 +9,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, getDoc, setDoc, updateDoc, deleteDoc, collection, onSnapshot,
+  doc, getDoc, setDoc, updateDoc, deleteDoc, collection, onSnapshot, writeBatch,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getMessaging, getToken, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
 
@@ -71,8 +71,30 @@ const PAY_MODES = ['UPI', 'Cash', 'Card', 'Bank'];
 const PERIODS = { day: 'Date', month: 'Month', year: 'Year', range: 'Range', all: 'All' };
 
 /* ---------------- Firestore store ---------------- */
+const DEFAULT_BOOK = 'personal'; // entries saved before books existed belong here
+const bookOf = t => t.bookId || DEFAULT_BOOK;
 const Store = {
-  uid: null, profile: null, txs: [], status: 'idle', error: '', unsubs: [], pending: false,
+  uid: null, profile: null, allTxs: [], books: [], bookId: DEFAULT_BOOK,
+  status: 'idle', error: '', unsubs: [], pending: false,
+  get txs() { return this.allTxs.filter(t => bookOf(t) === this.bookId); },
+  get book() { return this.books.find(b => b.id === this.bookId) || { id: this.bookId, name: 'Personal' }; },
+  setBook(id) {
+    this.bookId = id;
+    ls.set(`et_book_${this.uid}`, id);
+    refreshView();
+  },
+  bookRef(id) { return doc(db, 'users', this.uid, 'books', id); },
+  saveBook(id, name) { setDoc(this.bookRef(id), { name, updatedAt: Date.now() }, { merge: true }).catch(e => this.fail(e)); },
+  async deleteBook(id) {
+    // Delete the book and all of its entries (in batches; Firestore allows 500 writes per batch).
+    const refs = this.allTxs.filter(t => bookOf(t) === id).map(t => this.txRef(t.id));
+    refs.push(this.bookRef(id));
+    for (let i = 0; i < refs.length; i += 450) {
+      const batch = writeBatch(db);
+      refs.slice(i, i + 450).forEach(r => batch.delete(r));
+      batch.commit().catch(e => this.fail(e));
+    }
+  },
   get doc() {
     const c = (this.profile && this.profile.categories) || {};
     return {
@@ -80,7 +102,7 @@ const Store = {
         expense: Array.isArray(c.expense) && c.expense.length ? c.expense : DEFAULT_CATS.expense,
         income: Array.isArray(c.income) && c.income.length ? c.income : DEFAULT_CATS.income,
       },
-      transactions: this.txs,
+      transactions: this.txs, // current book only
     };
   },
   userRef() { return doc(db, 'users', this.uid); },
@@ -90,12 +112,23 @@ const Store = {
     this.stop();
     this.uid = uid;
     this.profile = profile;
+    this.bookId = ls.get(`et_book_${uid}`) || DEFAULT_BOOK;
     this.setStatus(navigator.onLine ? 'saving' : 'offline');
+    this.unsubs.push(onSnapshot(collection(db, 'users', uid, 'books'), snap => {
+      this.books = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || a.name.localeCompare(b.name));
+      if (!this.books.length && !snap.metadata.fromCache) {
+        // First time: create the default book (fixed id, so two phones can't create two).
+        setDoc(this.bookRef(DEFAULT_BOOK), { name: 'Personal', createdAt: 0 }, { merge: true }).catch(e => this.fail(e));
+      }
+      if (this.books.length && !this.books.some(b => b.id === this.bookId)) this.bookId = this.books[0].id;
+      refreshView();
+    }, err => this.fail(err)));
     this.unsubs.push(onSnapshot(this.userRef(), snap => {
       if (snap.exists()) { this.profile = snap.data(); refreshView(); }
     }, err => this.fail(err)));
     this.unsubs.push(onSnapshot(collection(db, 'users', uid, 'transactions'), { includeMetadataChanges: true }, snap => {
-      this.txs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      this.allTxs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       this.pending = snap.metadata.hasPendingWrites;
       this.setStatus(!navigator.onLine ? 'offline' : this.pending || snap.metadata.fromCache ? 'saving' : 'synced');
       refreshView();
@@ -106,7 +139,8 @@ const Store = {
     this.unsubs = [];
     this.uid = null;
     this.profile = null;
-    this.txs = [];
+    this.allTxs = [];
+    this.books = [];
   },
   fail(err) {
     console.error(err);
@@ -192,11 +226,20 @@ function byCategory(list) {
 /* ---------------- views ---------------- */
 const TITLES = { dashboard: 'Dashboard', income: 'Income', expense: 'Expense', settings: 'Settings' };
 
+// Book switcher shown above Dashboard / Income / Expense (like CashBook's books).
+function bookBar() {
+  const books = Store.books.length ? Store.books : [Store.book];
+  return `<div class="bookbar" role="tablist" aria-label="Books">
+    ${books.map(b => `<button class="book-chip${b.id === Store.bookId ? ' on' : ''}" data-action="pickBook" data-id="${esc(b.id)}" type="button">📒 ${esc(b.name)}</button>`).join('')}
+    <button class="book-chip add" data-action="newBook" type="button">+ New book</button>
+  </div>`;
+}
+
 function render() {
   const v = $('#view');
   if (!v) return;
-  if (ui.tab === 'dashboard') v.innerHTML = viewDashboard();
-  else if (ui.tab === 'income' || ui.tab === 'expense') { v.innerHTML = viewTxnTab(ui.tab); renderResults(ui.tab); }
+  if (ui.tab === 'dashboard') v.innerHTML = bookBar() + viewDashboard();
+  else if (ui.tab === 'income' || ui.tab === 'expense') { v.innerHTML = bookBar() + viewTxnTab(ui.tab); renderResults(ui.tab); }
   else { v.innerHTML = viewSettings(); fillReminderStatus(); }
   $('#pageTitle').textContent = TITLES[ui.tab];
   $$('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.tab === ui.tab));
@@ -269,7 +312,7 @@ function viewDashboard() {
     </div>
 
     <section class="card hero">
-      <div class="label">Balance${savePct !== null ? ` · ${savePct}% saved` : ''}</div>
+      <div class="label">${esc(Store.book.name)} · Balance${savePct !== null ? ` · ${savePct}% saved` : ''}</div>
       <div class="big">${bal < 0 ? '−' : ''}${money(Math.abs(bal))}</div>
       <div class="hero-split">
         <div><span>Income</span><b>${money(inc)}</b></div>
@@ -399,6 +442,24 @@ function viewSettings() {
     </section>
 
     <section class="card">
+      <h3>Books <small>${Store.books.length} ${Store.books.length === 1 ? 'book' : 'books'}</small></h3>
+      <div class="cat-list">
+        ${Store.books.map(b => {
+          const list = Store.allTxs.filter(t => bookOf(t) === b.id);
+          const bal = sum(list.filter(t => t.type === 'income')) - sum(list.filter(t => t.type === 'expense'));
+          return `<div class="cat-item">
+            <span>📒</span>
+            <span class="n">${esc(b.name)}${b.id === Store.bookId ? ' <span class="pill on">Open</span>' : ''}
+              <small class="muted" style="display:block">${list.length} ${list.length === 1 ? 'entry' : 'entries'} · balance ${bal < 0 ? '−' : ''}${money(Math.abs(bal))}</small></span>
+            <button class="x" data-action="editBook" data-id="${esc(b.id)}" type="button" aria-label="Rename ${esc(b.name)}">✏️</button>
+            <button class="x" data-action="delBook" data-id="${esc(b.id)}" type="button" aria-label="Delete ${esc(b.name)}">🗑</button>
+          </div>`;
+        }).join('')}
+      </div>
+      <button class="btn ghost block" style="margin-top:12px" data-action="newBook" type="button">+ New book</button>
+    </section>
+
+    <section class="card">
       <h3>Categories</h3>
       <div class="seg two">
         <button data-action="catType" data-t="expense" class="${t === 'expense' ? 'on' : ''}" type="button">Expense</button>
@@ -443,6 +504,20 @@ function openSheet(type = 'expense', tx = null) {
   if (!tx) setTimeout(() => $('#fAmount') && $('#fAmount').focus(), 250);
 }
 function closeSheet() { $('#sheetWrap').classList.add('hidden'); sheetState = null; }
+
+// New / rename book form (reuses the bottom sheet).
+function openBookSheet(book = null) {
+  sheetState = { kind: 'book', id: book ? book.id : null };
+  $('#sheet').innerHTML = `
+    <div class="grab"></div>
+    <h2>${book ? 'Rename book' : 'New book'} <button class="icon-btn" data-action="closeSheet" type="button" aria-label="Close">✕</button></h2>
+    <p class="muted" style="margin:-6px 0 14px;font-size:14px">Each book keeps its own entries and balance, e.g. Home, Shop, Trip.</p>
+    <label class="field"><span>Book name</span><input id="fBookName" maxlength="30" placeholder="e.g. Shop" value="${esc(book ? book.name : '')}"></label>
+    <p id="fErr" class="error"></p>
+    <div class="sheet-actions"><button class="btn primary" data-action="saveBookForm" type="button">${book ? 'Save' : 'Create book'}</button></div>`;
+  $('#sheetWrap').classList.remove('hidden');
+  setTimeout(() => $('#fBookName') && $('#fBookName').focus(), 250);
+}
 function readSheet() {
   if (!sheetState) return;
   const a = $('#fAmount'); if (a) sheetState.amount = a.value;
@@ -548,7 +623,7 @@ function exportCsv() {
   const csv = '﻿' + rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-  a.download = `expenses-${today()}.csv`;
+  a.download = `${Store.book.name.replace(/[^\w-]+/g, "-")}-${today()}.csv`;
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
@@ -603,8 +678,38 @@ const actions = {
     const id = s.id;
     closeSheet();
     if (id) Store.saveTx(id, { ...data, updatedAt: now });
-    else Store.saveTx(uid(), { ...data, createdAt: now, updatedAt: now });
+    else Store.saveTx(uid(), { ...data, bookId: Store.bookId, createdAt: now, updatedAt: now });
     toast(id ? 'Updated ✓' : `${data.type === 'income' ? 'Income' : 'Expense'} saved ✓`);
+  },
+  pickBook(el) { Store.setBook(el.dataset.id); toast(`Opened 📒 ${Store.book.name}`); },
+  newBook() { openBookSheet(); },
+  editBook(el) { const b = Store.books.find(x => x.id === el.dataset.id); if (b) openBookSheet(b); },
+  saveBookForm() {
+    const name = $('#fBookName').value.trim().replace(/\s+/g, ' ');
+    const err = $('#fErr');
+    if (!name) { err.textContent = 'Enter a book name'; return; }
+    const id = sheetState.id;
+    if (Store.books.some(b => b.id !== id && b.name.toLowerCase() === name.toLowerCase())) { err.textContent = 'A book with this name already exists'; return; }
+    closeSheet();
+    if (id) {
+      Store.saveBook(id, name);
+      toast('Book renamed ✓');
+    } else {
+      const newId = uid();
+      setDoc(Store.bookRef(newId), { name, createdAt: Date.now() }).catch(e => Store.fail(e));
+      Store.setBook(newId);
+      toast(`📒 ${name} created`);
+    }
+  },
+  delBook(el) {
+    const b = Store.books.find(x => x.id === el.dataset.id);
+    if (!b) return;
+    if (Store.books.length <= 1) return toast('Keep at least one book');
+    const n = Store.allTxs.filter(t => bookOf(t) === b.id).length;
+    if (!confirm(`Delete book "${b.name}"?${n ? `\nIts ${n} ${n === 1 ? 'entry' : 'entries'} will also be deleted. This cannot be undone.` : ''}`)) return;
+    if (b.id === Store.bookId) Store.setBook(Store.books.find(x => x.id !== b.id).id);
+    Store.deleteBook(b.id);
+    toast('Book deleted');
   },
   quickDelete(el) {
     const t = Store.txs.find(x => x.id === el.dataset.id);
@@ -666,6 +771,7 @@ document.addEventListener('submit', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && sheetState) closeSheet();
   if (e.key === 'Enter' && e.target.id === 'fNewCat') { e.preventDefault(); actions.saveNewCat(); }
+  if (e.key === 'Enter' && e.target.id === 'fBookName') { e.preventDefault(); actions.saveBookForm(); }
 });
 
 

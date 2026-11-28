@@ -232,3 +232,10 @@ main { max-width: 560px; margin: 0 auto; padding: 16px 16px calc(96px + env(safe
 
 @keyframes up { from { transform: translateY(100%); } to { transform: none; } }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+/* ---------- Books ---------- */
+.bookbar { display: flex; gap: 8px; overflow-x: auto; margin: -4px -16px 14px; padding: 2px 16px 6px; scrollbar-width: none; }
+.bookbar::-webkit-scrollbar { display: none; }
+.book-chip { flex: none; border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 8px 14px; font-size: 14px; font-weight: 600; white-space: nowrap; color: var(--text); }
+.book-chip.on { background: var(--orange); border-color: var(--orange); color: #fff; box-shadow: 0 4px 12px rgba(249, 115, 22, .25); }
+.book-chip.add { border-style: dashed; border-color: var(--orange-m); color: var(--orange-d); }

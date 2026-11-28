@@ -4,6 +4,7 @@ A simple income and expense tracker for a small group of people (white and orang
 
 - **Dashboard**: monthly balance, income and expense, today's spending, expense by category, and a 6-month trend.
 - **Income / Expense tabs**: filter by date, month, year, date range or all time, plus category and search.
+- **Books**: separate books (e.g. Home, Shop, Trip), each with its own entries and balance; switch at the top, manage in Settings.
 - **Categories**: each user manages their own (Settings, or **+ New** in the add form).
 - **Reminders**: push notifications every day at **6:35 PM, 10:00 PM and 11:00 PM** IST, with each user's own totals.
 - **Works offline**: changes sync when the phone is back online.
@@ -14,7 +15,7 @@ A simple income and expense tracker for a small group of people (white and orang
 |---|---|
 | App (this repo) | GitHub Pages: https://bhumitpatel1492.github.io/Expense_tracker/ |
 | Logins | Firebase Authentication. The mobile number is the username, plus a password. |
-| Data | Cloud Firestore: `users/{uid}` (profile + categories), `users/{uid}/transactions`, `users/{uid}/devices` |
+| Data | Cloud Firestore: `users/{uid}` (profile + categories), `users/{uid}/books` (CashBook-style books), `users/{uid}/transactions` (each with a `bookId`), `users/{uid}/devices` |
 | Privacy | `firebase/firestore.rules`: a user can only read and write their own documents |
 | Sign-up | Needs the invite code stored in Firestore at `config/app → inviteCode` |
 | Reminders | GitHub Actions cron in the private `Expense_tracker_backend` repo sends Firebase Cloud Messaging pushes |
