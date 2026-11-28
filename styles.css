@@ -239,3 +239,5 @@ main { max-width: 560px; margin: 0 auto; padding: 16px 16px calc(96px + env(safe
 .book-chip { flex: none; border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 8px 14px; font-size: 14px; font-weight: 600; white-space: nowrap; color: var(--text); }
 .book-chip.on { background: var(--orange); border-color: var(--orange); color: #fff; box-shadow: 0 4px 12px rgba(249, 115, 22, .25); }
 .book-chip.add { border-style: dashed; border-color: var(--orange-m); color: var(--orange-d); }
+
+.icon-btn:disabled { opacity: .35; cursor: default; }

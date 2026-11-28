@@ -308,7 +308,7 @@ function viewDashboard() {
     <div class="month-nav">
       <button class="icon-btn" data-action="dashMonth" data-dir="-1" type="button" aria-label="Previous month">‹</button>
       <b>${fmtMonth(m)}</b>
-      <button class="icon-btn" data-action="dashMonth" data-dir="1" type="button" aria-label="Next month">›</button>
+      <button class="icon-btn" data-action="dashMonth" data-dir="1" type="button" aria-label="Next month" ${m >= thisMonth() ? "disabled" : ""}>›</button>
     </div>
 
     <section class="card hero">
@@ -353,27 +353,32 @@ function viewDashboard() {
     </section>`;
 }
 
+// Future dates / months / years are never allowed: pickers stop at today and "›" is disabled there.
+const FILTER_MAX = { day: () => today(), month: () => thisMonth(), year: () => thisYear(), from: () => today(), to: () => today() };
+
 function periodInput(type, f) {
   const step = `data-action="stepPeriod" data-type="${type}"`;
+  const next = atMax => `<button class="icon-btn" ${step} data-dir="1" type="button" ${atMax ? 'disabled aria-disabled="true" title="Future is not allowed"' : ''}>›</button>`;
   switch (f.period) {
     case 'day':
       return `<button class="icon-btn" ${step} data-dir="-1" type="button">‹</button>
-        <input type="date" data-filter="day" data-type="${type}" value="${f.day}">
-        <button class="icon-btn" ${step} data-dir="1" type="button">›</button>`;
+        <input type="date" data-filter="day" data-type="${type}" value="${f.day}" max="${today()}">
+        ${next(f.day >= today())}`;
     case 'month':
       return `<button class="icon-btn" ${step} data-dir="-1" type="button">‹</button>
-        <input type="month" data-filter="month" data-type="${type}" value="${f.month}">
-        <button class="icon-btn" ${step} data-dir="1" type="button">›</button>`;
+        <input type="month" data-filter="month" data-type="${type}" value="${f.month}" max="${thisMonth()}">
+        ${next(f.month >= thisMonth())}`;
     case 'year': {
       const years = new Set([thisYear(), f.year, ...Store.txs.map(t => t.date.slice(0, 4))]);
+      const list = [...years].filter(y => y <= thisYear()).sort().reverse();
       return `<button class="icon-btn" ${step} data-dir="-1" type="button">‹</button>
-        <select data-filter="year" data-type="${type}">${[...years].sort().reverse().map(y => `<option ${y === f.year ? 'selected' : ''}>${y}</option>`).join('')}</select>
-        <button class="icon-btn" ${step} data-dir="1" type="button">›</button>`;
+        <select data-filter="year" data-type="${type}">${list.map(y => `<option ${y === f.year ? 'selected' : ''}>${y}</option>`).join('')}</select>
+        ${next(f.year >= thisYear())}`;
     }
     case 'range':
-      return `<input type="date" data-filter="from" data-type="${type}" value="${f.from}" aria-label="From">
+      return `<input type="date" data-filter="from" data-type="${type}" value="${f.from}" max="${f.to && f.to < today() ? f.to : today()}" aria-label="From">
         <span class="range-sep">to</span>
-        <input type="date" data-filter="to" data-type="${type}" value="${f.to}" aria-label="To">`;
+        <input type="date" data-filter="to" data-type="${type}" value="${f.to}" min="${f.from || ''}" max="${today()}" aria-label="To">`;
     default:
       return '<div class="all-time">Showing all entries</div>';
   }
@@ -543,7 +548,7 @@ function renderSheet() {
     ${s.addingCat ? `<div class="new-cat"><input id="fNewCat" maxlength="30" placeholder="Category name"><button class="btn primary" data-action="saveNewCat" type="button">Add</button></div>` : ''}
     ${s.type === 'expense' ? `<p class="label-sm">Paid by</p>
       <div class="chips">${PAY_MODES.map(m => `<button class="chip${m === s.mode ? ' on' : ''}" data-action="pickMode" data-m="${m}" type="button">${m}</button>`).join('')}</div>` : ''}
-    <label class="field"><span>Date</span><input id="fDate" type="date" value="${s.date}" max="${shiftDay(today(), 366)}"></label>
+    <label class="field"><span>Date</span><input id="fDate" type="date" value="${s.date}" max="${today()}"></label>
     <label class="field"><span>Note (optional)</span><input id="fNote" maxlength="120" placeholder="e.g. Lunch with friends" value="${esc(s.note)}"></label>
     <p id="fErr" class="error"></p>
     <div class="sheet-actions">
@@ -634,14 +639,23 @@ const actions = {
   add(el) { openSheet(el.dataset.type || (ui.tab === 'income' ? 'income' : 'expense')); },
   edit(el) { const t = Store.txs.find(x => x.id === el.dataset.id); if (t) openSheet(t.type, t); },
   closeSheet,
-  dashMonth(el) { ui.dashMonth = shiftMonth(ui.dashMonth, Number(el.dataset.dir)); render(); },
+  dashMonth(el) {
+    const m = shiftMonth(ui.dashMonth, Number(el.dataset.dir));
+    if (m > thisMonth()) return toast('Future months are not allowed');
+    ui.dashMonth = m;
+    render();
+  },
   period(el) { ui.filters[el.dataset.type].period = el.dataset.p; render(); },
   stepPeriod(el) {
     const f = ui.filters[el.dataset.type];
     const k = Number(el.dataset.dir);
-    if (f.period === 'day') f.day = shiftDay(f.day || today(), k);
-    if (f.period === 'month') f.month = shiftMonth(f.month || thisMonth(), k);
-    if (f.period === 'year') f.year = String(Number(f.year || thisYear()) + k);
+    const key = f.period;
+    let v = f[key];
+    if (key === 'day') v = shiftDay(v || today(), k);
+    if (key === 'month') v = shiftMonth(v || thisMonth(), k);
+    if (key === 'year') v = String(Number(v || thisYear()) + k);
+    if (v > FILTER_MAX[key]()) return toast('Future dates are not allowed');
+    f[key] = v;
     render();
   },
   catType(el) { ui.catType = el.dataset.t; render(); },
@@ -672,6 +686,7 @@ const actions = {
     if (!(amount > 0)) { err.textContent = 'Enter an amount greater than 0'; $('#fAmount').focus(); return; }
     if (!s.category) { err.textContent = 'Choose a category'; return; }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(s.date)) { err.textContent = 'Choose a date'; return; }
+    if (s.date > today()) { err.textContent = 'Future date is not allowed. Choose today or an earlier date.'; $('#fDate').focus(); return; }
     const data = { type: s.type, amount, category: s.category, date: s.date, note: s.note.trim() };
     if (s.type === 'expense') data.mode = s.mode; else data.mode = '';
     const now = Date.now();
@@ -754,7 +769,14 @@ function onFilter(e) {
   if (!el) return;
   const type = el.dataset.type;
   const f = ui.filters[type];
-  f[el.dataset.filter] = el.value;
+  const key = el.dataset.filter;
+  let v = el.value;
+  // A typed-in future value (pickers already block it) is pulled back to today / this month / this year.
+  if (FILTER_MAX[key] && v && v > FILTER_MAX[key]()) { v = FILTER_MAX[key](); toast('Future dates are not allowed'); }
+  f[key] = v;
+  if (key === 'from' && f.to && f.from > f.to) f.to = f.from;
+  if (key === 'to' && f.from && f.to < f.from) f.from = f.to;
+  if (FILTER_MAX[key]) { render(); return; } // refresh inputs and the "›" buttons
   renderResults(type);
 }
 document.addEventListener('input', e => { if (e.target.matches('[data-filter="q"]')) onFilter(e); });
